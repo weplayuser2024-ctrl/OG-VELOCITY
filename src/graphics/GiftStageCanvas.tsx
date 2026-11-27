@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import type { ActiveGiftEvent, SupportRingEvent } from '../types';
-import { GiftArtwork } from './GiftArtwork';
+import { ChromaKeyVideo, GiftArtwork } from './GiftArtwork';
 import { RingSpriteArt } from './SpriteArtwork';
 
 interface GiftStageCanvasProps {
@@ -166,13 +166,11 @@ export const GiftStageCanvas: React.FC<GiftStageCanvasProps> = ({
           className="relative flex flex-col items-center gap-3 rounded-3xl border border-cyan-400/35 bg-[#0D1526]/95 px-8 py-6 text-center shadow-2xl"
         >
           {activeEvent.gift.customVideoUrl ? (
-            <video
+            <ChromaKeyVideo
               src={activeEvent.gift.customVideoUrl}
-              autoPlay
-              loop
-              playsInline
-              muted
-              className="h-44 w-44 rounded-2xl border border-cyan-400/50 bg-black/50 object-cover shadow-2xl"
+              width={180}
+              height={180}
+              className="drop-shadow-[0_0_24px_rgba(34,211,238,0.45)]"
             />
           ) : (
             <GiftArtwork giftId={activeEvent.gift.id} gift={activeEvent.gift} size={110} />

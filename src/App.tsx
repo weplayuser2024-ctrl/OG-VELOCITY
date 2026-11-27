@@ -1,41 +1,51 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Headphones, Lock, Sparkles, X } from 'lucide-react';
-import { AuthScreen } from './components/AuthScreen';
+import { getRedirectResult, onAuthStateChanged, signOut, type Auth, type User } from 'firebase/auth';
+import { AdminPanel } from './components/AdminPanel';
+import { AuthScreen, mapFirebaseAuthError, type AuthErrorInfo, type VerifiedLoginPayload } from './components/AuthScreen';
+import { auth, firebasePersistenceReady, getAllAuthInstances } from './firebase';
 import { BottomNav } from './components/BottomNav';
 import { ChatSection } from './components/ChatSection';
 import { CreateRoomModal } from './components/CreateRoomModal';
 import { DiscoverSection } from './components/DiscoverSection';
 import { HomeHub } from './components/HomeHub';
 import { MeProfileShop, type MeViewMode } from './components/MeProfileShop';
+import { UpiPaymentModal, type ActivePaymentOrderPayload } from './components/UpiPaymentModal';
 import { UserProfileModal } from './components/UserProfileModal';
 import { VoiceRoomStage, type VipEntryShowcase } from './components/VoiceRoomStage';
 import {
-  AVATAR_ROSTER,
-  INITIAL_CHAT_THREADS,
+  COIN_PACKAGES,
   INITIAL_DAILY_TASKS,
-  INITIAL_FRIENDS,
   INITIAL_INTIMATE_SPACE,
-  INITIAL_MOMENTS,
-  INITIAL_ROOMS,
   INITIAL_ROOM_TASKS,
   ROOM_BACKGROUND_THEMES,
   SHOP_ITEMS,
   USER_PROFILE,
+  VIP_PLANS,
   VIRTUAL_GIFTS,
   getAdminSlotCount,
   getCpLevelInfo,
   getRoomNextExp,
   getVipNameColor,
   getVipTierByGrowth,
+  setDynamicShopItemsCache,
 } from './data/zayroData';
 import { AmbientCanvas } from './graphics/AmbientCanvas';
 import { GiftArtwork } from './graphics/GiftArtwork';
 import { GiftStageCanvas } from './graphics/GiftStageCanvas';
 import type {
+  AccountRole,
   ActiveGiftEvent,
+  AppConfig,
   AuthProvider,
   AvatarConfig,
+  BackendEventRecord,
+  BackendNotificationRecord,
+  BackendOrderRecord,
+  BackendWalletTx,
   ChatThread,
+  ClosedRoomNotice,
+  CpRelationshipHistoryRecord,
   CpRequest,
   CustomGiftSubmission,
   DailyTaskItem,
@@ -45,24 +55,130 @@ import type {
   MomentPost,
   NavSection,
   PublicUserProfile,
+  ReferralSummary,
+  RelationshipTagKey,
+  RelationshipTagSummary,
   RoomListener,
+  RoomSettingsConfig,
   RoomTaskItem,
   ShopCategory,
   ShopItem,
   SupportRingEvent,
+  VipDecayConfig,
+  VipPointLedgerRecord,
+  VipSubscriptionHistoryRecord,
   VirtualGift,
   VoiceRoom,
+  WithdrawalRequestRecord,
 } from './types';
+import { syncOwnFirestorePresenceAndProfile } from './utils/firestoreSync';
+import { ogRealtime } from './utils/realtimeClient';
 import { soundFx } from './utils/soundFx';
 
-function loadStoredJson<T>(key: string, fallback: T): T {
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
+const ADMIN_ROLES = new Set<AccountRole>(['support_staff', 'moderator', 'admin', 'super_admin']);
+const DEFAULT_ROOM_CLOSED_MESSAGE =
+  'This room has been closed because the Owner and Admin are no longer present.';
+
+function extractRequestedRoomIdFromLocation(): string | null {
+  if (typeof window === 'undefined') return null;
+  const params = new URLSearchParams(window.location.search);
+  const qRoom = params.get('room')?.trim();
+  if (qRoom) return qRoom;
+  const pathMatch = window.location.pathname.match(/^\/rooms\/([^/]+)/);
+  if (pathMatch?.[1]) {
+    try {
+      return decodeURIComponent(pathMatch[1]).trim() || null;
+    } catch {
+      return pathMatch[1].trim() || null;
+    }
   }
+  return null;
+}
+
+interface BackendRoomSummary {
+  id: string;
+  roomCode: string;
+  title: string;
+  topic?: string;
+  category: string;
+  ownerUid: string;
+  hostName: string;
+  adminUids?: string[];
+  memberUids?: string[];
+  isOfficial?: boolean;
+  seatCapacity?: number;
+  roomLevel?: number;
+  roomXp?: number;
+  bgThemeId?: string;
+  bgUrl?: string | null;
+  dpUrl?: string | null;
+  isLocked?: boolean;
+  roomSettings?: RoomSettingsConfig;
+  onlineCount?: number;
+  status?: 'active' | 'closed';
+  closedReason?: string | null;
+}
+
+function mapBackendRoomToVoiceRoom(
+  br: BackendRoomSummary,
+  currentUid: string,
+  existing?: VoiceRoom
+): VoiceRoom {
+  const capacity =
+    br.seatCapacity && [10, 15, 19].includes(br.seatCapacity)
+      ? br.seatCapacity
+      : br.isOfficial
+        ? 19
+        : 10;
+  const existingSeats =
+    existing && existing.seats.length === capacity
+      ? existing.seats
+      : Array.from({ length: capacity }, (_, i) => ({
+          seatIndex: i,
+          occupant: null,
+          role: 'empty' as const,
+          isMuted: false,
+          isLocked: false,
+          isSpeaking: false,
+          audioLevel: 0,
+          giftScore: 0,
+        }));
+  const foundTheme = ROOM_BACKGROUND_THEMES.find((t) => t.id === br.bgThemeId);
+  return {
+    id: br.id,
+    uid: br.roomCode || br.id,
+    title: br.title,
+    topic: br.topic || 'Live Voice Sanctuary',
+    category: (br.category as VoiceRoom['category']) || 'Popular',
+    tags: [br.category || 'Voice'],
+    hostName: br.hostName,
+    ownerUid: br.ownerUid,
+    adminUids: Array.isArray(br.adminUids) ? br.adminUids : [],
+    memberUids: Array.isArray(br.memberUids) ? br.memberUids : [br.ownerUid],
+    dpUrl: br.dpUrl || existing?.dpUrl || undefined,
+    isOfficial: Boolean(br.isOfficial),
+    isUserCreated: !br.isOfficial && br.ownerUid === currentUid,
+    roomType: 'voice',
+    level: Number(br.roomLevel ?? 1),
+    xp: Number(br.roomXp ?? 0),
+    listenerCount:
+      br.onlineCount !== undefined && br.onlineCount !== null
+        ? Math.max(0, Number(br.onlineCount))
+        : (existing?.listenerCount ?? existing?.listeners?.length ?? 0),
+    ambiance: foundTheme?.ambiance ?? 'saffron',
+    bgThemeId: br.bgThemeId || 'bg-nebula',
+    bgUrl: br.bgUrl || undefined,
+    isRoomLocked: Boolean(br.isLocked),
+    roomSettings: br.roomSettings ?? existing?.roomSettings,
+    status: br.status || 'active',
+    closedReason: br.closedReason || null,
+    seats: existingSeats,
+    coinsSpentByUid: existing?.coinsSpentByUid ?? {},
+    listeners: existing?.listeners ?? [],
+    micRequests: existing?.micRequests ?? [],
+    messages: existing?.messages ?? [],
+    pkState: existing?.pkState,
+  };
 }
 
 function getTodayDateKey(): string {
@@ -72,140 +188,1242 @@ function getTodayDateKey(): string {
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [isCheckingSession, setIsCheckingSession] = useState<boolean>(true);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [sessionRetryNonce, setSessionRetryNonce] = useState<number>(0);
+  const [authError, setAuthError] = useState<AuthErrorInfo | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [verifiedEmail, setVerifiedEmail] = useState<string | null>(null);
+  const [userRole, setUserRole] = useState<AccountRole>('normal_user');
+
+  const isAuthenticatedRef = useRef<boolean>(false);
+  const authenticatedUidRef = useRef<string | null>(null);
+  const isLoggingOutRef = useRef<boolean>(false);
+  const startupDoneRef = useRef<boolean>(false);
+  const inFlightVerifyRef = useRef<{ uid: string; promise: Promise<VerifiedLoginPayload> } | null>(null);
+  const pendingRoomLinkRef = useRef<string | null>(extractRequestedRoomIdFromLocation());
+  const activeRoomIdRef = useRef<string | null>(null);
+  const userSeatIndexRef = useRef<number | null>(null);
+  const isMicMutedRef = useRef<boolean>(false);
+  const exitingRoomIdRef = useRef<string | null>(null);
+  const pendingRoomJoinIdRef = useRef<string | null>(null);
+  const [isAdminRoute, setIsAdminRoute] = useState<boolean>(
+    () => typeof window !== 'undefined' && window.location.pathname.startsWith('/admin')
+  );
   const [activeSection, setActiveSection] = useState<NavSection>('home');
-  const [userProfile, setUserProfile] = useState<AvatarConfig>(() => {
-    const loaded = loadStoredJson<AvatarConfig>('zayro_user_profile', USER_PROFILE);
-    return {
-      ...loaded,
-      email: loaded.email === 'weplayuser2024@gmail.com' ? '' : loaded.email,
-    };
-  });
+  const [userProfile, setUserProfile] = useState<AvatarConfig>(() => ({
+    ...USER_PROFILE,
+    email: '',
+  }));
 
-  // VIP Growth: starts at 0 for new users (VIP 0) — 1 Growth point earned per 100 Coins spent
-  const [vipGrowth, setVipGrowth] = useState<number>(() =>
-    loadStoredJson<number>('zayro_vip_growth', 0)
-  );
-  const [subscribedVipLevel, setSubscribedVipLevel] = useState<number>(() =>
-    loadStoredJson<number>('zayro_subscribed_vip', 0)
-  );
-  const [vipLabel, setVipLabel] = useState<string | null>(null);
+  const [vipStatus, setVipStatus] = useState<'Not Active' | 'Active'>('Not Active');
+  const [giftsReceivedCount, setGiftsReceivedCount] = useState<number>(0);
+  const [accountStatus, setAccountStatus] = useState<'Active' | 'Suspended'>('Active');
 
-  const [rooms, setRooms] = useState<VoiceRoom[]>(() => {
-    const saved = loadStoredJson<VoiceRoom[] | null>('zayro_rooms_v1', null);
-    if (!saved || !Array.isArray(saved) || saved.length === 0) return INITIAL_ROOMS;
-    return saved.map((r) => {
-      const targetCount = r.isOfficial ? 15 : 10;
-      const cleaned = r.seats
-        .slice(0, targetCount)
-        .map((s) =>
-          s.isUser
-            ? {
-                ...s,
-                occupant: null,
-                role: 'empty' as const,
-                isUser: false,
-                isSpeaking: false,
-                audioLevel: 0,
-              }
-            : s
-        );
-      while (cleaned.length < targetCount) {
-        cleaned.push({
-          seatIndex: cleaned.length,
-          occupant: null,
-          role: 'empty',
-          isMuted: false,
-          isLocked: false,
-          isSpeaking: false,
-          audioLevel: 0,
-          giftScore: 0,
+  const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
+  const [hasMoreMessagesByUid, setHasMoreMessagesByUid] = useState<Record<string, boolean>>({});
+  const oldestMsgCreatedAtRef = useRef<Record<string, string>>({});
+  const [vipPackages, setVipPackages] = useState<
+    Array<{ id: string; name: string; priceInr: number; durationDays?: number; coinsIncluded?: number; vipLevel?: number; perks?: string[] }>
+  >(() =>
+    VIP_PLANS.map((p) => ({
+      id: p.id,
+      name: p.name,
+      priceInr: p.priceInr,
+      durationDays: p.durationDays,
+      vipLevel: p.grantedVipLevel,
+      perks: p.perks,
+    }))
+  );
+  const [coinPackages, setCoinPackages] = useState<
+    Array<{ id: string; label: string; coins: number; priceInr: number; highlight?: string }>
+  >(() =>
+    COIN_PACKAGES.map((c) => ({
+      id: c.id,
+      label: c.label,
+      coins: c.coins + (c.bonusCoins ?? 0),
+      priceInr: c.priceInr,
+      highlight: c.highlight,
+    }))
+  );
+  const [orders, setOrders] = useState<BackendOrderRecord[]>([]);
+  const [walletTransactions, setWalletTransactions] = useState<BackendWalletTx[]>([]);
+  const [events, setEvents] = useState<BackendEventRecord[]>([]);
+  const [notifications, setNotifications] = useState<BackendNotificationRecord[]>([]);
+  const [pendingFriendRequests, setPendingFriendRequests] = useState<
+    Array<{ id: number; requesterUid: string; name: string; publicId: string; photoUrl?: string }>
+  >([]);
+  const [activePaymentOrder, setActivePaymentOrder] = useState<ActivePaymentOrderPayload | null>(null);
+  const [appNotice, setAppNotice] = useState<string | null>(null);
+
+  const authTokenRef = useRef<string | null>(authToken);
+  authTokenRef.current = authToken;
+  const toastTimeoutRef = useRef<number | null>(null);
+  const roomsRefreshTimerRef = useRef<number | null>(null);
+  const exitingRoomTimerRef = useRef<number | null>(null);
+  const tokenRefreshPromiseRef = useRef<Promise<string | null> | null>(null);
+
+  const showToast = useCallback((msg: string) => {
+    setAppNotice(msg);
+    if (toastTimeoutRef.current) {
+      window.clearTimeout(toastTimeoutRef.current);
+    }
+    toastTimeoutRef.current = window.setTimeout(() => {
+      toastTimeoutRef.current = null;
+      setAppNotice((prev) => (prev === msg ? null : prev));
+    }, 3600);
+  }, []);
+
+  const refreshBackendSessionToken = useCallback(async (): Promise<string | null> => {
+    if (tokenRefreshPromiseRef.current) {
+      return tokenRefreshPromiseRef.current;
+    }
+    const task = (async (): Promise<string | null> => {
+      try {
+        const activeFbUser = getAllAuthInstances().find((inst) => inst.currentUser)?.currentUser ?? null;
+        if (!activeFbUser) return null;
+        const idToken = await activeFbUser.getIdToken(true);
+        const verifyResp = await fetch('/api/auth/verify-firebase', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ idToken }),
         });
+        if (!verifyResp.ok) return null;
+        const data = (await verifyResp.json().catch(() => null)) as { ok?: boolean; token?: string } | null;
+        if (data?.ok && data.token) {
+          authTokenRef.current = data.token;
+          setAuthToken(data.token);
+          return data.token;
+        }
+        return null;
+      } catch {
+        return null;
+      } finally {
+        tokenRefreshPromiseRef.current = null;
       }
-      const initialRoom = INITIAL_ROOMS.find((ir) => ir.id === r.id);
-      return {
-        ...r,
-        seats: cleaned,
-        coinsSpentByUid: r.coinsSpentByUid ?? initialRoom?.coinsSpentByUid ?? {},
-      };
-    });
-  });
+    })();
+    tokenRefreshPromiseRef.current = task;
+    return task;
+  }, []);
+
+  const apiFetch = useCallback(
+    async (url: string, init?: RequestInit) => {
+      const headers = new Headers(init?.headers || {});
+      const token = authTokenRef.current || authToken;
+      if (token && !headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${token}`);
+      }
+      const resp = await fetch(url, {
+        ...init,
+        headers,
+        credentials: 'include',
+      });
+      if (resp.status === 401 && !isLoggingOutRef.current) {
+        const renewed = await refreshBackendSessionToken();
+        if (renewed) {
+          const retryHeaders = new Headers(init?.headers || {});
+          retryHeaders.set('Authorization', `Bearer ${renewed}`);
+          return fetch(url, {
+            ...init,
+            headers: retryHeaders,
+            credentials: 'include',
+          });
+        }
+      }
+      return resp;
+    },
+    [authToken, refreshBackendSessionToken]
+  );
+
+  // VIP Growth: starts at 0 for new users (VIP 0 · Not Active)
+  const [vipGrowth, setVipGrowth] = useState<number>(0);
+  const [subscribedVipLevel, setSubscribedVipLevel] = useState<number>(0);
+  const [vipEarnedLevel, setVipEarnedLevel] = useState<number>(0);
+  const [vipLabel, setVipLabel] = useState<string | null>(null);
+  const [vipExpiresAt, setVipExpiresAt] = useState<string | null>(null);
+  const [vipGraceEndsAt, setVipGraceEndsAt] = useState<string | null>(null);
+  const [vipNextDecayAt, setVipNextDecayAt] = useState<string | null>(null);
+  const [vipInGracePeriod, setVipInGracePeriod] = useState<boolean>(false);
+  const [vipGraceDays, setVipGraceDays] = useState<number>(15);
+  const [vipDecayConfig, setVipDecayConfig] = useState<VipDecayConfig | null>(null);
+  const [vipPointLedger, setVipPointLedger] = useState<VipPointLedgerRecord[]>([]);
+  const [vipSubscriptionHistory, setVipSubscriptionHistory] = useState<VipSubscriptionHistoryRecord[]>([]);
+  const [cpRelationshipHistory, setCpRelationshipHistory] = useState<CpRelationshipHistoryRecord[]>([]);
+
+  const [rooms, setRooms] = useState<VoiceRoom[]>([]);
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
+  const [closedRoomNotice, setClosedRoomNotice] = useState<ClosedRoomNotice | null>(null);
   const [pendingLockedRoomId, setPendingLockedRoomId] = useState<string | null>(null);
   const [pinEntry, setPinEntry] = useState<string>('');
   const [pinError, setPinError] = useState<string>('');
   const [unlockedRoomIds, setUnlockedRoomIds] = useState<string[]>([]);
-  const [hasCreatedRoom, setHasCreatedRoom] = useState<boolean>(() =>
-    loadStoredJson<boolean>('zayro_has_created_room', false)
-  );
+  const [hasCreatedRoom, setHasCreatedRoom] = useState<boolean>(false);
   const [inspectedUser, setInspectedUser] = useState<PublicUserProfile | null>(null);
 
-  const [coins, setCoins] = useState<number>(() =>
-    loadStoredJson<number>('zayro_coins', 0)
-  );
+  const [coins, setCoins] = useState<number>(0);
   const [dailyLoginClaimed, setDailyLoginClaimed] = useState<boolean>(false);
-  const [charm, setCharm] = useState<number>(() =>
-    loadStoredJson<number>('zayro_charm', 0)
-  );
+  const [charm, setCharm] = useState<number>(0);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState<boolean>(false);
   const [speakerEnabled, setSpeakerEnabled] = useState<boolean>(true);
-  const [giftAnimationsEnabled, setGiftAnimationsEnabled] = useState<boolean>(() =>
-    loadStoredJson<boolean>('zayro_gift_animations', true)
-  );
+  const [giftAnimationsEnabled, setGiftAnimationsEnabled] = useState<boolean>(true);
   const [activeGiftEvent, setActiveGiftEvent] = useState<ActiveGiftEvent | null>(null);
   const [bigGiftBanner, setBigGiftBanner] = useState<ActiveGiftEvent | null>(null);
   const [supportRingEvent, setSupportRingEvent] = useState<SupportRingEvent | null>(null);
 
   // Social, Tasks, Moments, CP Requests, Custom Gifts & Intimate Space
   const [dailyTasks, setDailyTasks] = useState<DailyTaskItem[]>(INITIAL_DAILY_TASKS);
+  const [claimedTaskChests, setClaimedTaskChests] = useState<number[]>([]);
   const [roomTasks, setRoomTasks] = useState<RoomTaskItem[]>(INITIAL_ROOM_TASKS);
-  const [friends, setFriends] = useState<FriendRecord[]>(() =>
-    loadStoredJson<FriendRecord[]>('zayro_friends', INITIAL_FRIENDS)
-  );
-  const [cpRequests, setCpRequests] = useState<CpRequest[]>(() =>
-    loadStoredJson<CpRequest[]>('zayro_cp_requests', [])
-  );
-  const [customGifts, setCustomGifts] = useState<CustomGiftSubmission[]>(() =>
-    loadStoredJson<CustomGiftSubmission[]>('zayro_custom_gifts', [])
-  );
-  const [userGiftsGivenCoins, setUserGiftsGivenCoins] = useState<number>(() =>
-    loadStoredJson<number>('zayro_gifts_given_coins', 0)
-  );
-  const [chatThreads, setChatThreads] = useState<ChatThread[]>(INITIAL_CHAT_THREADS);
-  const [moments, setMoments] = useState<MomentPost[]>(INITIAL_MOMENTS);
+  const [friends, setFriends] = useState<FriendRecord[]>([]);
+  const [outgoingPendingFriendUids, setOutgoingPendingFriendUids] = useState<string[]>([]);
+  const [cpRequests, setCpRequests] = useState<CpRequest[]>([]);
+  const [customGifts, setCustomGifts] = useState<CustomGiftSubmission[]>([]);
+  const [serverGifts, setServerGifts] = useState<VirtualGift[]>([]);
+  const [shopItems, setShopItems] = useState<ShopItem[]>(SHOP_ITEMS);
+  const [referralSummary, setReferralSummary] = useState<ReferralSummary | null>(null);
+  const [userGiftsGivenCoins, setUserGiftsGivenCoins] = useState<number>(0);
+  const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
+  const [moments, setMoments] = useState<MomentPost[]>([]);
+  const [sharedMoments, setSharedMoments] = useState<MomentPost[]>([]);
   const [intimateSpace, setIntimateSpace] = useState<IntimateSpaceData>(INITIAL_INTIMATE_SPACE);
-  const [receivedGiftIds, setReceivedGiftIds] = useState<string[]>(() =>
-    loadStoredJson<string[]>('zayro_received_gifts', [])
-  );
-  const [customQrUrl, setCustomQrUrl] = useState<string | null>(() =>
-    loadStoredJson<string | null>('zayro_custom_qr', null)
-  );
+  const [receivedGiftIds, setReceivedGiftIds] = useState<string[]>([]);
 
-  // Me Profile & Shop state (zero items for fresh account)
+  // Me Profile & Shop state (zero items for fresh account; 3-day duration on frames)
   const [meDefaultTab, setMeDefaultTab] = useState<MeViewMode>('profile');
-  const [ownedItemIds, setOwnedItemIds] = useState<string[]>(() =>
-    loadStoredJson<string[]>('zayro_owned_items', [])
-  );
-  const [equippedItems, setEquippedItems] = useState<Partial<Record<ShopCategory, string>>>(() =>
-    loadStoredJson<Partial<Record<ShopCategory, string>>>('zayro_equipped_items', {})
-  );
+  const [ownedItemExpiries, setOwnedItemExpiries] = useState<Record<string, number>>({});
+  const [ownedItemIds, setOwnedItemIds] = useState<string[]>([]);
+  const [equippedItems, setEquippedItems] = useState<Partial<Record<ShopCategory, string>>>({});
 
-  // Live microphone state for Voice Rooms
+  const [, setWithdrawals] = useState<WithdrawalRequestRecord[]>([]);
+  const [relationshipTags, setRelationshipTags] = useState<RelationshipTagSummary[]>([]);
+  const [walletFrozen, setWalletFrozen] = useState<boolean>(false);
+  const [themeMode, setThemeMode] = useState<'dark' | 'light'>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = window.localStorage.getItem('ogv_theme_mode');
+      if (saved === 'light' || saved === 'dark') return saved;
+    }
+    return 'dark';
+  });
+  const [roomVideoSync, setRoomVideoSync] = useState<{
+    roomId: string;
+    sourceType: 'youtube' | 'local';
+    youtubeUrl: string;
+    playing: boolean;
+    title: string;
+    updatedBy?: string;
+    ts: number;
+  } | null>(null);
+
+  // Live microphone state for Voice Rooms (backed strictly by ogRealtime WebRTC + WebAudio AnalyserNode)
   const [userSeatIndex, setUserSeatIndex] = useState<number | null>(null);
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
   const [isLiveMicActive, setIsLiveMicActive] = useState<boolean>(false);
   const [vipEntryBanner, setVipEntryBanner] = useState<VipEntryShowcase | null>(null);
 
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micAnalyserRef = useRef<AnalyserNode | null>(null);
-  const micAudioCtxRef = useRef<AudioContext | null>(null);
+  const roomParticipantUidsRef = useRef<string[]>([]);
+  const prevSpeakingEmitRef = useRef<boolean>(false);
   const giftTimeoutRef = useRef<number | null>(null);
   const bigGiftTimeoutRef = useRef<number | null>(null);
   const supportTimeoutRef = useRef<number | null>(null);
   const vipEntryTimeoutRef = useRef<number | null>(null);
   const emoteSeatTimeoutRef = useRef<number | null>(null);
 
-  const growthTier = getVipTierByGrowth(vipGrowth).current.level;
-  const effectiveVipLevel = Math.min(18, Math.max(subscribedVipLevel, growthTier));
+  const applyServerUserSnapshot = useCallback(
+    (srvUser: {
+      uid: string;
+      publicId?: string;
+      email?: string | null;
+      phone?: string | null;
+      role?: AccountRole;
+      name: string;
+      photoUrl?: string | null;
+      coverUrl?: string | null;
+      handle: string;
+      charmPoints?: number;
+      vipLevel?: number;
+      vipEarnedLevel?: number;
+      vipStatus?: 'Not Active' | 'Active';
+      vipGrowth?: number;
+      vipPlanLabel?: string | null;
+      vipExpiresAt?: string | null;
+      vipGraceEndsAt?: string | null;
+      vipNextDecayAt?: string | null;
+      vipInGracePeriod?: boolean;
+      vipGraceDays?: number;
+      cpPartner?: AvatarConfig['cpPartner'];
+      coins?: number;
+      giftsReceived?: number;
+      accountStatus?: string;
+      bio?: string;
+      gender?: 'Male' | 'Female' | 'Other';
+      age?: number;
+      country?: string;
+      ornament?: AvatarConfig['ornament'];
+      equippedFrameId?: string | null;
+      equippedRingId?: string | null;
+      equippedEntryId?: string | null;
+      equippedEmoteId?: string | null;
+      themeMode?: 'dark' | 'light';
+      walletFrozen?: boolean;
+      relationshipTags?: RelationshipTagSummary[];
+    }) => {
+      setVerifiedEmail(srvUser.email || srvUser.phone || srvUser.publicId || srvUser.uid);
+      if (srvUser.role) {
+        setUserRole(srvUser.role);
+      }
+      if (srvUser.themeMode === 'light' || srvUser.themeMode === 'dark') {
+        setThemeMode(srvUser.themeMode);
+      }
+      if (srvUser.walletFrozen !== undefined) {
+        setWalletFrozen(Boolean(srvUser.walletFrozen));
+      }
+      if (Array.isArray(srvUser.relationshipTags)) {
+        setRelationshipTags(srvUser.relationshipTags);
+      }
+      setUserProfile((prev) => ({
+        ...prev,
+        uid: srvUser.uid,
+        publicId: srvUser.publicId ?? prev.publicId,
+        email: srvUser.email ?? '',
+        name: srvUser.name || prev.name,
+        photoUrl: srvUser.photoUrl ?? prev.photoUrl,
+        coverUrl: srvUser.coverUrl ?? prev.coverUrl,
+        handle: srvUser.handle || prev.handle,
+        bio: srvUser.bio !== undefined ? srvUser.bio : prev.bio,
+        gender: srvUser.gender ?? prev.gender,
+        age: srvUser.age ?? prev.age,
+        country: srvUser.country ?? prev.country,
+        ornament: srvUser.ornament ?? prev.ornament,
+        themeMode: srvUser.themeMode ?? prev.themeMode,
+        equippedEmoteId:
+          srvUser.equippedEmoteId !== undefined ? srvUser.equippedEmoteId : prev.equippedEmoteId,
+        cpPartner: srvUser.cpPartner !== undefined ? srvUser.cpPartner : prev.cpPartner,
+      }));
+      setCoins(Number(srvUser.coins ?? 0));
+      setCharm(Number(srvUser.charmPoints ?? 0));
+      setVipGrowth(Number(srvUser.vipGrowth ?? 0));
+      setSubscribedVipLevel(Math.min(18, Number(srvUser.vipLevel ?? 0)));
+      if (srvUser.vipEarnedLevel !== undefined) {
+        setVipEarnedLevel(Math.min(18, Number(srvUser.vipEarnedLevel ?? 0)));
+      }
+      setVipStatus(srvUser.vipStatus === 'Active' ? 'Active' : 'Not Active');
+      setVipLabel(srvUser.vipPlanLabel ?? null);
+      if (srvUser.vipExpiresAt !== undefined) setVipExpiresAt(srvUser.vipExpiresAt ?? null);
+      if (srvUser.vipGraceEndsAt !== undefined) setVipGraceEndsAt(srvUser.vipGraceEndsAt ?? null);
+      if (srvUser.vipNextDecayAt !== undefined) setVipNextDecayAt(srvUser.vipNextDecayAt ?? null);
+      if (srvUser.vipInGracePeriod !== undefined) setVipInGracePeriod(Boolean(srvUser.vipInGracePeriod));
+      if (srvUser.vipGraceDays !== undefined) setVipGraceDays(Number(srvUser.vipGraceDays ?? 15));
+      setGiftsReceivedCount(Number(srvUser.giftsReceived ?? 0));
+      const rawStatus = String(srvUser.accountStatus || 'active').toLowerCase();
+      setAccountStatus(rawStatus === 'suspended' || rawStatus === 'banned' ? 'Suspended' : 'Active');
+
+      if (
+        srvUser.equippedFrameId !== undefined ||
+        srvUser.equippedRingId !== undefined ||
+        srvUser.equippedEntryId !== undefined
+      ) {
+        setEquippedItems((prev) => ({
+          ...prev,
+          frame: srvUser.equippedFrameId || undefined,
+          ring: srvUser.equippedRingId || undefined,
+          entry: srvUser.equippedEntryId || undefined,
+        }));
+      }
+    },
+    []
+  );
+
+  // Sync HTML root classes (Tailwind .dark & .ogv-theme-light) and localStorage
+  useEffect(() => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.toggle('dark', themeMode === 'dark');
+      document.documentElement.classList.toggle('ogv-theme-light', themeMode === 'light');
+    }
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('ogv_theme_mode', themeMode);
+    }
+  }, [themeMode]);
+
+  // Sync browser /admin URL history
+  useEffect(() => {
+    const onPopState = () => {
+      setIsAdminRoute(window.location.pathname.startsWith('/admin'));
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  const openAdminConsole = useCallback(() => {
+    if (!ADMIN_ROLES.has(userRole)) return;
+    if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/admin')) {
+      window.history.pushState(null, '', '/admin');
+    }
+    setIsAdminRoute(true);
+  }, [userRole]);
+
+  const exitAdminConsole = useCallback(() => {
+    if (typeof window !== 'undefined' && window.location.pathname.startsWith('/admin')) {
+      window.history.pushState(null, '', '/');
+    }
+    setIsAdminRoute(false);
+  }, []);
+
+  const applyVerifiedPayloadToApp = useCallback(
+    (payload: VerifiedLoginPayload) => {
+      if (!payload.token || !payload.uid) return;
+      setAuthToken(payload.token);
+      authenticatedUidRef.current = payload.uid;
+      isAuthenticatedRef.current = true;
+      applyServerUserSnapshot({
+        uid: payload.uid,
+        publicId: payload.publicId,
+        role: payload.role,
+        email: payload.identifier.includes('@') ? payload.identifier : null,
+        phone: payload.identifier.startsWith('+') ? payload.identifier : null,
+        name: payload.name,
+        photoUrl: payload.photoUrl,
+        handle: payload.handle,
+        charmPoints: payload.charmPoints,
+        vipLevel: payload.vipLevel,
+        vipStatus: payload.vipStatus,
+        vipGrowth: payload.vipGrowth,
+        vipPlanLabel: payload.vipPlanLabel,
+        coins: payload.coins,
+        giftsReceived: payload.giftsReceived,
+        accountStatus: payload.accountStatus,
+      });
+
+      if (typeof window !== 'undefined' && window.location.pathname.startsWith('/admin') && ADMIN_ROLES.has(payload.role)) {
+        setIsAdminRoute(true);
+      } else if (typeof window !== 'undefined' && window.location.pathname !== '/') {
+        const roomFromPath = window.location.pathname.match(/^\/rooms\/([^/]+)/)?.[1];
+        const nextUrl = roomFromPath
+          ? `/?room=${encodeURIComponent(roomFromPath)}`
+          : `/${window.location.search}`;
+        window.history.replaceState(null, '', nextUrl);
+        setIsAdminRoute(false);
+      }
+      setAuthError(null);
+      setIsAuthenticated(true);
+      setActiveSection('home');
+    },
+    [applyServerUserSnapshot]
+  );
+
+  const verifyFirebaseUserPayload = useCallback(
+    async (
+      fbUser: User,
+      opts?: { forceRefresh?: boolean; preferredProvider?: AuthProvider }
+    ): Promise<VerifiedLoginPayload> => {
+      if (inFlightVerifyRef.current?.uid === fbUser.uid) {
+        return inFlightVerifyRef.current.promise;
+      }
+
+      const promise = (async (): Promise<VerifiedLoginPayload> => {
+        const idToken = await fbUser.getIdToken(Boolean(opts?.forceRefresh));
+        const verifyResp = await fetch('/api/auth/verify-firebase', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ idToken }),
+        });
+
+        const verifyData = (await verifyResp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          token?: string;
+          isNewUser?: boolean;
+          user?: Parameters<typeof applyServerUserSnapshot>[0] & {
+            provider?: AuthProvider;
+          };
+        };
+
+        if (!verifyResp.ok || !verifyData.ok || !verifyData.token || !verifyData.user) {
+          const message =
+            verifyData.error || 'Backend verification of your Google session failed. Please try again.';
+          console.error('[Auth] Backend verify-firebase rejected:', verifyResp.status, message);
+          if (auth) {
+            await signOut(auth).catch(() => {});
+          }
+          setAuthError({
+            code: verifyResp.status === 403 ? 'auth/backend-rejected' : 'auth/backend-error',
+            message,
+          });
+          throw new Error(message);
+        }
+
+        const srv = verifyData.user;
+        const rawStatus = String(srv.accountStatus || 'active').toLowerCase();
+        return {
+          provider: opts?.preferredProvider || srv.provider || 'google',
+          name: srv.name,
+          identifier: srv.email || srv.phone || srv.publicId || srv.uid,
+          photoUrl: srv.photoUrl || fbUser.photoURL || undefined,
+          token: verifyData.token,
+          uid: srv.uid,
+          publicId: srv.publicId || srv.uid,
+          handle: srv.handle,
+          role: srv.role || 'normal_user',
+          charmPoints: Number(srv.charmPoints ?? 0),
+          vipLevel: Number(srv.vipLevel ?? 0),
+          vipStatus: srv.vipStatus === 'Active' ? 'Active' : 'Not Active',
+          vipGrowth: Number(srv.vipGrowth ?? 0),
+          vipPlanLabel: srv.vipPlanLabel ?? null,
+          coins: Number(srv.coins ?? 0),
+          giftsReceived: Number(srv.giftsReceived ?? 0),
+          accountStatus:
+            rawStatus === 'banned'
+              ? 'Banned'
+              : rawStatus === 'suspended'
+                ? 'Suspended'
+                : 'Active',
+          isNewUser: Boolean(verifyData.isNewUser),
+        };
+      })();
+
+      inFlightVerifyRef.current = { uid: fbUser.uid, promise };
+      try {
+        return await promise;
+      } finally {
+        if (inFlightVerifyRef.current?.promise === promise) {
+          inFlightVerifyRef.current = null;
+        }
+      }
+    },
+    []
+  );
+
+  // Capture ?ref=CODE referral code from invite links on first load
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const url = new URL(window.location.href);
+      const refCode = url.searchParams.get('ref')?.trim().toUpperCase();
+      if (refCode) {
+        localStorage.setItem('ogv_pending_ref', refCode);
+        url.searchParams.delete('ref');
+        window.history.replaceState(null, '', url.pathname + url.search);
+      }
+    } catch {
+      // Ignore malformed URL
+    }
+  }, []);
+
+  // Authoritative Firebase persistence + getRedirectResult + onAuthStateChanged + backend session restore
+  useEffect(() => {
+    let cancelled = false;
+    startupDoneRef.current = false;
+    setIsCheckingSession(true);
+    setSessionError(null);
+
+    const withTimeout = <T,>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        const timer = window.setTimeout(() => reject(new Error(timeoutMessage)), ms);
+        promise.then(
+          (val) => {
+            window.clearTimeout(timer);
+            resolve(val);
+          },
+          (err) => {
+            window.clearTimeout(timer);
+            reject(err);
+          }
+        );
+      });
+
+    const unsubAuth = auth
+      ? onAuthStateChanged(auth, async (fbUser) => {
+          if (cancelled || !startupDoneRef.current || isLoggingOutRef.current || !fbUser) {
+            return;
+          }
+          if (isAuthenticatedRef.current && authenticatedUidRef.current === fbUser.uid) {
+            return;
+          }
+          try {
+            const payload = await verifyFirebaseUserPayload(fbUser, { forceRefresh: false });
+            if (!cancelled && !isLoggingOutRef.current && !isAuthenticatedRef.current) {
+              applyVerifiedPayloadToApp(payload);
+            }
+          } catch {
+            // Error state and logging handled inside verifyFirebaseUserPayload
+          }
+        })
+      : undefined;
+
+    (async () => {
+      try {
+        await withTimeout(
+          firebasePersistenceReady,
+          8000,
+          'Firebase persistence initialization timed out'
+        ).catch((err) => {
+          console.warn('[Auth] Persistence readiness warning:', err instanceof Error ? err.message : err);
+        });
+
+        const authCandidates = getAllAuthInstances();
+        if (authCandidates.length > 0) {
+          // Always process redirect result BEFORE checking backend cookies or rendering Login
+          try {
+            let redirectUser: User | null = null;
+            let redirectProvider: string | null = null;
+            for (const candidateAuth of authCandidates) {
+              const redirectResult = await withTimeout(
+                getRedirectResult(candidateAuth),
+                15000,
+                'Google redirect verification timed out. Please try again.'
+              );
+              if (redirectResult?.user) {
+                redirectUser = redirectResult.user;
+                redirectProvider = redirectResult.providerId || 'google.com';
+                break;
+              }
+            }
+            if (!cancelled && redirectUser) {
+              console.log(
+                '[Auth] Processed Firebase redirect result for provider:',
+                redirectProvider || 'google.com'
+              );
+              const payload = await verifyFirebaseUserPayload(redirectUser, {
+                forceRefresh: true,
+              });
+              if (!cancelled) {
+                applyVerifiedPayloadToApp(payload);
+                return;
+              }
+            }
+          } catch (redirectErr) {
+            const isTimeout =
+              redirectErr instanceof Error &&
+              redirectErr.message.includes('timed out');
+            const mapped = isTimeout
+              ? { code: 'auth/redirect-timeout', message: redirectErr.message }
+              : mapFirebaseAuthError(redirectErr);
+            console.error('[Auth] getRedirectResult error:', mapped.code);
+            if (!cancelled) {
+              setAuthError(mapped);
+              setIsAuthenticated(false);
+              isAuthenticatedRef.current = false;
+              authenticatedUidRef.current = null;
+            }
+            return;
+          }
+
+          // Wait for Firebase Auth indexedDB/localStorage state to finish hydrating across configured instances
+          for (const candidateAuth of authCandidates) {
+            const authWithReady = candidateAuth as Auth & { authStateReady?: () => Promise<void> };
+            if (typeof authWithReady.authStateReady === 'function') {
+              await withTimeout(
+                authWithReady.authStateReady(),
+                8000,
+                'Firebase authStateReady timed out'
+              ).catch((err) => {
+                console.warn('[Auth] authStateReady warning:', err instanceof Error ? err.message : err);
+              });
+            }
+          }
+
+          const hydratedFbUser =
+            auth?.currentUser ||
+            authCandidates.find((inst) => inst.currentUser)?.currentUser ||
+            null;
+          if (!cancelled && hydratedFbUser) {
+            try {
+              const payload = await verifyFirebaseUserPayload(hydratedFbUser, {
+                forceRefresh: false,
+              });
+              if (!cancelled) {
+                applyVerifiedPayloadToApp(payload);
+                return;
+              }
+            } catch {
+              if (!cancelled) {
+                setIsAuthenticated(false);
+                isAuthenticatedRef.current = false;
+                authenticatedUidRef.current = null;
+              }
+              return;
+            }
+          }
+        }
+
+        // Fall back to existing backend HTTP-only session cookie on refresh
+        const resp = await fetch('/api/auth/session', {
+          method: 'GET',
+          credentials: 'include',
+        });
+        if (resp.ok) {
+          const data = (await resp.json()) as {
+            ok?: boolean;
+            token?: string | null;
+            user?: Parameters<typeof applyServerUserSnapshot>[0];
+          };
+          if (!cancelled && data.ok && data.user) {
+            if (data.token) {
+              setAuthToken(data.token);
+            }
+            authenticatedUidRef.current = data.user.uid;
+            isAuthenticatedRef.current = true;
+            applyServerUserSnapshot(data.user);
+            setAuthError(null);
+            setIsAuthenticated(true);
+            return;
+          }
+        }
+
+        if (!cancelled) {
+          isAuthenticatedRef.current = false;
+          authenticatedUidRef.current = null;
+          setIsAuthenticated(false);
+          setVerifiedEmail(null);
+          setAuthToken(null);
+          setUserRole('normal_user');
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unable to verify your session right now.';
+        console.error('[Auth] Startup session verification error:', msg);
+        if (!cancelled) {
+          setSessionError(msg);
+          isAuthenticatedRef.current = false;
+          authenticatedUidRef.current = null;
+          setIsAuthenticated(false);
+          setVerifiedEmail(null);
+          setAuthToken(null);
+        }
+      } finally {
+        startupDoneRef.current = true;
+        if (!cancelled) {
+          setIsCheckingSession(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unsubAuth?.();
+    };
+  }, [applyServerUserSnapshot, applyVerifiedPayloadToApp, verifyFirebaseUserPayload, sessionRetryNonce]);
+
+  const hydrateBackendState = useCallback(async () => {
+    try {
+      const [
+        bootResp,
+        walletResp,
+        friendsResp,
+        momentsResp,
+        sharedMomentsResp,
+      ] = await Promise.all([
+        apiFetch('/api/protected/bootstrap'),
+        apiFetch('/api/wallet/state'),
+        apiFetch('/api/friends'),
+        apiFetch('/api/moments'),
+        apiFetch('/api/moments/shared').catch(() => null),
+      ]);
+
+      if (bootResp.ok) {
+        const boot = (await bootResp.json()) as {
+          ok?: boolean;
+          appConfig?: AppConfig;
+          shopItems?: ShopItem[];
+          customGifts?: CustomGiftSubmission[];
+          referralSummary?: ReferralSummary;
+          gifts?: Array<{
+            id: string;
+            name: string;
+            cost: number;
+            charmValue: number;
+            randomCoinsMin?: number;
+            randomCoinsMax?: number;
+            rarity?: string;
+            primaryColor?: string;
+            secondaryColor?: string;
+            description?: string;
+            particleStyle?: string;
+            giftNumber?: number;
+            artworkUrl?: string | null;
+            animationUrl?: string | null;
+          }>;
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+          vipPackages?: Array<{ id: string; name: string; priceInr: number; durationDays?: number; grantedVipLevel?: number; perks?: string[] }>;
+          coinPackages?: Array<{ id: string; label: string; coins: number; bonusCoins?: number; priceInr: number; highlight?: string }>;
+          vipDecayConfig?: VipDecayConfig;
+          vipPointLedger?: VipPointLedgerRecord[];
+          vipSubscriptionHistory?: VipSubscriptionHistoryRecord[];
+          cpState?: {
+            cpPartner?: AvatarConfig['cpPartner'];
+            proposals?: CpRequest[];
+            history?: CpRelationshipHistoryRecord[];
+          };
+          tasks?: Array<{
+            id: string;
+            title: string;
+            subtitle?: string | null;
+            rewardCoins: number;
+            progress?: number;
+            targetCount?: number;
+            claimed?: boolean;
+          }>;
+          claimedTaskChests?: number[];
+          events?: BackendEventRecord[];
+          notifications?: BackendNotificationRecord[];
+          orders?: BackendOrderRecord[];
+          withdrawals?: WithdrawalRequestRecord[];
+          relationshipTags?: RelationshipTagSummary[];
+          inventory?: Array<{ itemId: string; expiresAt?: string | null }>;
+          rooms?: BackendRoomSummary[];
+        };
+
+        if (boot.appConfig) setAppConfig(boot.appConfig);
+        if (Array.isArray(boot.shopItems) && boot.shopItems.length > 0) {
+          setShopItems(boot.shopItems);
+          setDynamicShopItemsCache(boot.shopItems);
+        }
+        if (Array.isArray(boot.customGifts)) {
+          setCustomGifts(boot.customGifts);
+        }
+        if (Array.isArray(boot.gifts) && boot.gifts.length > 0) {
+          setServerGifts(
+            boot.gifts.map((g, idx) => ({
+              id: String(g.id),
+              name: String(g.name),
+              cost: Number(g.cost ?? 10),
+              charmValue: Number(g.charmValue ?? 10),
+              randomCoinsMin: Number(g.randomCoinsMin ?? 5),
+              randomCoinsMax: Number(g.randomCoinsMax ?? 15),
+              rarity: (['Standard', 'Signature', 'Mythic'].includes(String(g.rarity))
+                ? g.rarity
+                : 'Standard') as VirtualGift['rarity'],
+              primaryColor: String(g.primaryColor || '#A855F7'),
+              secondaryColor: String(g.secondaryColor || '#38BDF8'),
+              description: String(g.description || ''),
+              particleStyle: (g.particleStyle || 'heart') as VirtualGift['particleStyle'],
+              giftNumber: Number(g.giftNumber ?? idx + 1),
+              customArtworkUrl: g.artworkUrl || undefined,
+              customVideoUrl: g.animationUrl || undefined,
+              isCustomApproved:
+                String(g.id).startsWith('gift-cg-') || Boolean(g.artworkUrl || g.animationUrl),
+            }))
+          );
+        }
+        if (boot.referralSummary) {
+          setReferralSummary(boot.referralSummary);
+        }
+        if (boot.user) applyServerUserSnapshot(boot.user);
+        if (boot.vipDecayConfig) setVipDecayConfig(boot.vipDecayConfig);
+        if (Array.isArray(boot.vipPointLedger)) setVipPointLedger(boot.vipPointLedger);
+        if (Array.isArray(boot.vipSubscriptionHistory)) setVipSubscriptionHistory(boot.vipSubscriptionHistory);
+        if (Array.isArray(boot.withdrawals)) setWithdrawals(boot.withdrawals);
+        if (Array.isArray(boot.relationshipTags)) setRelationshipTags(boot.relationshipTags);
+        if (boot.cpState) {
+          setUserProfile((prev) => ({ ...prev, cpPartner: boot.cpState!.cpPartner ?? null }));
+          if (Array.isArray(boot.cpState.proposals)) setCpRequests(boot.cpState.proposals);
+          if (Array.isArray(boot.cpState.history)) setCpRelationshipHistory(boot.cpState.history);
+          if (boot.cpState.cpPartner) {
+            setIntimateSpace((prev) => ({
+              ...prev,
+              partnerName: boot.cpState!.cpPartner!.partnerName,
+              partnerAvatarId: boot.cpState!.cpPartner!.partnerAvatarId,
+              progress: boot.cpState!.cpPartner!.cpCharm ?? 0,
+            }));
+          } else {
+            setIntimateSpace(INITIAL_INTIMATE_SPACE);
+          }
+        }
+        if (Array.isArray(boot.vipPackages) && boot.vipPackages.length > 0) {
+          setVipPackages(
+            boot.vipPackages.map((p) => ({
+              id: p.id,
+              name: p.name,
+              priceInr: Number(p.priceInr),
+              durationDays: Number(p.durationDays ?? 30),
+              vipLevel: Number(p.grantedVipLevel ?? 1),
+              perks: Array.isArray(p.perks) ? p.perks : [],
+            }))
+          );
+        }
+        if (Array.isArray(boot.coinPackages) && boot.coinPackages.length > 0) {
+          setCoinPackages(
+            boot.coinPackages.map((c) => ({
+              id: c.id,
+              label: c.label,
+              coins: Number(c.coins) + Number(c.bonusCoins ?? 0),
+              priceInr: Number(c.priceInr),
+              highlight: c.highlight,
+            }))
+          );
+        }
+        if (Array.isArray(boot.tasks)) {
+          setDailyTasks(
+            boot.tasks.map((t) => ({
+              id: String(t.id),
+              title: String(t.title),
+              subtitle: t.subtitle ? String(t.subtitle) : undefined,
+              rewardCoins: Number(t.rewardCoins ?? 0),
+              progress: Number(t.progress ?? 0),
+              target: Number(t.targetCount ?? 1),
+              claimed: Boolean(t.claimed),
+            }))
+          );
+          const checkin = boot.tasks.find((t) => t.id === 'task-checkin');
+          if (checkin) setDailyLoginClaimed(Boolean(checkin.claimed));
+        }
+        if (Array.isArray(boot.claimedTaskChests)) {
+          setClaimedTaskChests(boot.claimedTaskChests.map(Number));
+        }
+        if (Array.isArray(boot.events)) setEvents(boot.events);
+        if (Array.isArray(boot.notifications)) setNotifications(boot.notifications);
+        if (Array.isArray(boot.orders)) setOrders(boot.orders);
+
+        if (Array.isArray(boot.inventory)) {
+          const now = Date.now();
+          const ids: string[] = [];
+          const expiries: Record<string, number> = {};
+          for (const row of boot.inventory) {
+            if (row.expiresAt) {
+              const expMs = new Date(row.expiresAt).getTime();
+              if (expMs <= now) continue;
+              expiries[row.itemId] = expMs;
+            }
+            if (!ids.includes(row.itemId)) ids.push(row.itemId);
+          }
+          setOwnedItemIds(ids);
+          setOwnedItemExpiries(expiries);
+        }
+
+        if (Array.isArray(boot.rooms)) {
+          const currentUid = boot.user?.uid ?? userProfile.uid;
+          setHasCreatedRoom(boot.rooms.some((r) => !r.isOfficial && r.ownerUid === currentUid));
+          setRooms((prev) =>
+            boot.rooms!.map((br) =>
+              mapBackendRoomToVoiceRoom(
+                br,
+                currentUid,
+                prev.find((p) => p.id === br.id)
+              )
+            )
+          );
+        }
+      }
+
+      if (walletResp.ok) {
+        const wData = (await walletResp.json()) as { transactions?: BackendWalletTx[] };
+        if (Array.isArray(wData.transactions)) {
+          setWalletTransactions(wData.transactions);
+        }
+      }
+
+      if (friendsResp.ok) {
+        const fData = (await friendsResp.json()) as {
+          relations?: Array<{
+            id: number;
+            status: string;
+            direction: 'incoming' | 'outgoing';
+            online?: boolean;
+            lastSeenAt?: string | null;
+            peer?: {
+              uid: string;
+              publicId?: string;
+              name: string;
+              photoUrl?: string | null;
+              equippedFrameId?: string | null;
+              vipLevel?: number;
+            } | null;
+          }>;
+        };
+        if (Array.isArray(fData.relations)) {
+          const acceptedFriends: FriendRecord[] = [];
+          const outgoingIds: string[] = [];
+          const incomingPending: Array<{
+            id: number;
+            requesterUid: string;
+            name: string;
+            publicId: string;
+            photoUrl?: string;
+          }> = [];
+          for (const rel of fData.relations) {
+            if (!rel.peer) continue;
+            if (rel.status === 'accepted') {
+              const peerPublicId = rel.peer.publicId || rel.peer.uid;
+              acceptedFriends.push({
+                uid: peerPublicId,
+                publicId: peerPublicId,
+                name: rel.peer.name,
+                avatarId: peerPublicId,
+                photoUrl: rel.peer.photoUrl || undefined,
+                equippedFrameId: rel.peer.equippedFrameId ?? null,
+                vipLevel: Number(rel.peer.vipLevel ?? 0),
+                online: Boolean(rel.online),
+                lastSeenAt: rel.lastSeenAt ?? null,
+                status: rel.online ? 'Online' : 'Offline',
+              });
+            } else if (rel.status === 'pending' && rel.direction === 'incoming') {
+              incomingPending.push({
+                id: rel.id,
+                requesterUid: rel.peer.uid,
+                name: rel.peer.name,
+                publicId: rel.peer.publicId || rel.peer.uid,
+                photoUrl: rel.peer.photoUrl || undefined,
+              });
+            } else if (rel.status === 'pending' && rel.direction === 'outgoing') {
+              if (rel.peer.uid) outgoingIds.push(rel.peer.uid);
+              if (rel.peer.publicId) outgoingIds.push(rel.peer.publicId);
+            }
+          }
+          setFriends(acceptedFriends);
+          setOutgoingPendingFriendUids(Array.from(new Set(outgoingIds)));
+          setPendingFriendRequests(incomingPending);
+          setChatThreads((prev) => {
+            const existingMap = new Map(prev.map((t) => [t.friendUid, t]));
+            const nextThreads: ChatThread[] = [];
+            for (const fr of acceptedFriends) {
+              const cur = existingMap.get(fr.uid);
+              if (cur) {
+                nextThreads.push({
+                  ...cur,
+                  friendPublicId: fr.publicId || fr.uid,
+                  friendName: fr.name,
+                  photoUrl: fr.photoUrl,
+                  friendVipLevel: fr.vipLevel,
+                  equippedFrameId: fr.equippedFrameId ?? null,
+                  online: fr.online,
+                  lastSeenAt: fr.lastSeenAt ?? null,
+                  status: fr.status,
+                });
+              } else {
+                nextThreads.push({
+                  friendUid: fr.uid,
+                  friendPublicId: fr.publicId || fr.uid,
+                  friendName: fr.name,
+                  avatarId: fr.avatarId,
+                  photoUrl: fr.photoUrl,
+                  friendVipLevel: fr.vipLevel,
+                  equippedFrameId: fr.equippedFrameId ?? null,
+                  online: fr.online,
+                  lastSeenAt: fr.lastSeenAt ?? null,
+                  status: fr.status,
+                  unread: 0,
+                  messages: [],
+                });
+              }
+            }
+            return nextThreads;
+          });
+        }
+      }
+
+      if (momentsResp.ok) {
+        const mData = (await momentsResp.json()) as {
+          posts?: Array<{
+            id: string;
+            authorUid: string;
+            authorName: string;
+            mediaType?: string;
+            mediaUrl?: string | null;
+            caption?: string;
+            visibility?: string;
+            allowedUids?: string[];
+            likesCount?: number;
+            likedByMe?: boolean;
+            createdAt?: string;
+          }>;
+        };
+        if (Array.isArray(mData.posts)) {
+          setMoments(
+            mData.posts.map((p) => ({
+              id: p.id,
+              authorUid: p.authorUid,
+              authorName: p.authorName,
+              avatarId: p.authorUid || 'member',
+              mediaType: p.mediaType === 'video' ? 'video' : 'photo',
+              mediaUrl: p.mediaUrl || undefined,
+              mediaTitle: `${p.authorName}'s Moment`,
+              caption: p.caption || '',
+              visibility: p.visibility === 'selected' ? 'selected' : 'public',
+              allowedUids: Array.isArray(p.allowedUids) ? p.allowedUids : [],
+              mediaGradient:
+                p.mediaType === 'video'
+                  ? 'linear-gradient(135deg, #4c0519 0%, #7c2d12 45%, #0f172a 100%)'
+                  : 'linear-gradient(135deg, #064e3b 0%, #1e3a8a 50%, #090b12 100%)',
+              timestamp: p.createdAt ? new Date(p.createdAt).toLocaleString() : 'Recently',
+              likes: Number(p.likesCount ?? 0),
+              liked: Boolean(p.likedByMe),
+            }))
+          );
+        }
+      }
+
+      if (sharedMomentsResp && sharedMomentsResp.ok) {
+        const smData = (await sharedMomentsResp.json().catch(() => null)) as {
+          posts?: Array<{
+            id: string;
+            authorUid: string;
+            authorName: string;
+            mediaType?: string;
+            mediaUrl?: string | null;
+            caption?: string;
+            visibility?: string;
+            allowedUids?: string[];
+            likesCount?: number;
+            likedByMe?: boolean;
+            createdAt?: string;
+          }>;
+        } | null;
+        if (Array.isArray(smData?.posts)) {
+          setSharedMoments(
+            smData.posts.map((p) => ({
+              id: p.id,
+              authorUid: p.authorUid,
+              authorName: p.authorName,
+              avatarId: p.authorUid || 'member',
+              mediaType: p.mediaType === 'video' ? 'video' : 'photo',
+              mediaUrl: p.mediaUrl || undefined,
+              mediaTitle: `${p.authorName}'s Moment`,
+              caption: p.caption || '',
+              visibility: p.visibility === 'selected' ? 'selected' : 'public',
+              allowedUids: Array.isArray(p.allowedUids) ? p.allowedUids : [],
+              mediaGradient:
+                p.mediaType === 'video'
+                  ? 'linear-gradient(135deg, #4c0519 0%, #7c2d12 45%, #0f172a 100%)'
+                  : 'linear-gradient(135deg, #064e3b 0%, #1e3a8a 50%, #090b12 100%)',
+              timestamp: p.createdAt ? new Date(p.createdAt).toLocaleString() : 'Recently',
+              likes: Number(p.likesCount ?? 0),
+              liked: Boolean(p.likedByMe),
+            }))
+          );
+        }
+      }
+    } catch {
+      // Network retry handled naturally on next action or WS event
+    }
+  }, [apiFetch, applyServerUserSnapshot, userProfile.uid]);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      void hydrateBackendState();
+    }
+  }, [isAuthenticated, hydrateBackendState]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !userProfile.uid) return;
+    void syncOwnFirestorePresenceAndProfile({
+      publicId: userProfile.publicId || userProfile.uid,
+      name: userProfile.name,
+      handle: userProfile.handle,
+      photoUrl: userProfile.photoUrl ?? null,
+      equippedFrameId: equippedItems.frame ?? null,
+      vipLevel: vipStatus === 'Active' ? subscribedVipLevel : 0,
+      online: true,
+      email: userProfile.email ?? null,
+    });
+  }, [
+    isAuthenticated,
+    userProfile.uid,
+    userProfile.publicId,
+    userProfile.name,
+    userProfile.handle,
+    userProfile.photoUrl,
+    userProfile.email,
+    equippedItems.frame,
+    vipStatus,
+    subscribedVipLevel,
+  ]);
+
+  // Server determines authoritative active VIP tier (0 when Not Active, >= 1 when Active)
+  const effectiveVipLevel = vipStatus === 'Active' ? Math.max(1, Math.min(18, subscribedVipLevel)) : 0;
+
+  const handleClaimReferralCode = useCallback(
+    async (rawCode: string): Promise<{ ok: boolean; message: string }> => {
+      const inviteCode = rawCode.trim().toUpperCase();
+      if (!inviteCode) {
+        return { ok: false, message: 'Enter an invite code to claim your reward.' };
+      }
+      try {
+        const resp = await apiFetch('/api/referrals/claim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ inviteCode }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          rewardCoins?: number;
+          inviterPublicId?: string;
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+          referralSummary?: ReferralSummary;
+        };
+        if (!resp.ok || !data.ok) {
+          return { ok: false, message: data.error || 'Could not claim invite code.' };
+        }
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('ogv_pending_ref');
+        }
+        if (data.user) applyServerUserSnapshot(data.user);
+        if (data.referralSummary) setReferralSummary(data.referralSummary);
+        soundFx.playVictory();
+        const msg = `Referral linked! +${Number(data.rewardCoins ?? 25000).toLocaleString()} Coins credited.`;
+        showToast(msg);
+        void hydrateBackendState();
+        return { ok: true, message: msg };
+      } catch {
+        return { ok: false, message: 'Network error claiming invite code.' };
+      }
+    },
+    [apiFetch, applyServerUserSnapshot, hydrateBackendState, showToast]
+  );
+
+  useEffect(() => {
+    if (!isAuthenticated || !referralSummary || typeof window === 'undefined') return;
+    const pendingRef = localStorage.getItem('ogv_pending_ref')?.trim().toUpperCase();
+    if (!pendingRef) return;
+    if (
+      referralSummary.referredByPublicId ||
+      pendingRef === referralSummary.inviteCode.toUpperCase() ||
+      pendingRef === (userProfile.publicId || '').toUpperCase()
+    ) {
+      localStorage.removeItem('ogv_pending_ref');
+      return;
+    }
+    void handleClaimReferralCode(pendingRef).then((res) => {
+      if (!res.ok) {
+        localStorage.removeItem('ogv_pending_ref');
+      }
+    });
+  }, [isAuthenticated, referralSummary, userProfile.publicId, handleClaimReferralCode]);
+
+  const inspectUserProfile = useCallback(
+    (profile: PublicUserProfile) => {
+      setInspectedUser(profile);
+      const lookupId = profile.avatar.publicId || profile.avatar.uid;
+      if (!lookupId) return;
+      void apiFetch(`/api/users/${encodeURIComponent(lookupId)}/profile`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: { ok?: boolean; profile?: PublicUserProfile } | null) => {
+          if (d?.ok && d.profile) {
+            setInspectedUser(d.profile);
+          }
+        })
+        .catch(() => {});
+    },
+    [apiFetch]
+  );
+
+  const inspectUserById = useCallback(
+    (uidOrPublicId: string) => {
+      const clean = uidOrPublicId.trim();
+      if (!clean) return;
+      void apiFetch(`/api/users/${encodeURIComponent(clean)}/profile`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: { ok?: boolean; profile?: PublicUserProfile } | null) => {
+          if (d?.ok && d.profile) {
+            setInspectedUser(d.profile);
+          } else {
+            showToast('Player profile could not be loaded.');
+          }
+        })
+        .catch(() => showToast('Unable to load user profile.'));
+    },
+    [apiFetch, showToast]
+  );
 
   const activeRoom = activeRoomId ? (rooms.find((r) => r.id === activeRoomId) ?? null) : null;
 
@@ -229,39 +1447,23 @@ export default function App() {
       isCustomApproved: true,
     }));
 
-  const allGifts: VirtualGift[] = [...VIRTUAL_GIFTS, ...approvedCustomGifts];
+  const allGifts: VirtualGift[] =
+    serverGifts.length > 0 ? serverGifts : [...VIRTUAL_GIFTS, ...approvedCustomGifts];
 
-  const equippedRingColor = SHOP_ITEMS.find((i) => i.id === equippedItems.ring)?.previewColor;
-  const equippedBubbleColor = SHOP_ITEMS.find((i) => i.id === equippedItems.bubble)?.previewColor;
+  const equippedRingColor = shopItems.find((i) => i.id === equippedItems.ring)?.previewColor;
+  const equippedBubbleColor = shopItems.find((i) => i.id === equippedItems.bubble)?.previewColor;
   const equippedFrameId = equippedItems.frame;
-  const equippedSeatEffect = SHOP_ITEMS.find((i) => i.id === equippedItems['seat-fx'])?.name;
+  const equippedSeatEffect = shopItems.find((i) => i.id === equippedItems['seat-fx'])?.name;
 
   const unreadChats = chatThreads.reduce((sum, t) => sum + t.unread, 0);
-
-  const advanceDailyTask = useCallback((taskId: string) => {
-    setDailyTasks((prev) =>
-      prev.map((task) =>
-        task.id === taskId && task.progress < task.target
-          ? { ...task, progress: task.target }
-          : task
-      )
-    );
-  }, []);
-
-  // Earn 1 VIP Growth point per 100 Coins spent
-  const applyCoinSpend = useCallback((coinsSpent: number) => {
-    const earnedGrowth = Math.floor(coinsSpent / 100);
-    if (earnedGrowth > 0) {
-      setVipGrowth((prev) => prev + earnedGrowth);
-    }
-    return earnedGrowth;
-  }, []);
 
   const handleToggleSpeaker = () => {
     setSpeakerEnabled((prev) => {
       const next = !prev;
       soundFx.enabled = next;
+      ogRealtime.setSpeakerMuted(!next);
       if (next) {
+        void ogRealtime.unlockAudioPlayback();
         soundFx.playMove();
       }
       return next;
@@ -270,57 +1472,785 @@ export default function App() {
 
   // Cleanup microphone stream on unmount
   const stopMicrophone = useCallback(() => {
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((t) => t.stop());
-      micStreamRef.current = null;
-    }
-    if (micAudioCtxRef.current) {
-      micAudioCtxRef.current.close().catch(() => {});
-      micAudioCtxRef.current = null;
-    }
-    micAnalyserRef.current = null;
+    roomParticipantUidsRef.current = [];
+    prevSpeakingEmitRef.current = false;
     setIsLiveMicActive(false);
+    ogRealtime.leaveVoiceAudio();
   }, []);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem('zayro_rooms_v1', JSON.stringify(rooms));
-      window.localStorage.setItem('zayro_has_created_room', JSON.stringify(hasCreatedRoom));
-      window.localStorage.setItem('zayro_user_profile', JSON.stringify(userProfile));
-      window.localStorage.setItem('zayro_coins', JSON.stringify(coins));
-      window.localStorage.setItem('zayro_charm', JSON.stringify(charm));
-      window.localStorage.setItem('zayro_vip_growth', JSON.stringify(vipGrowth));
-      window.localStorage.setItem('zayro_subscribed_vip', JSON.stringify(subscribedVipLevel));
-      window.localStorage.setItem('zayro_friends', JSON.stringify(friends));
-      window.localStorage.setItem('zayro_cp_requests', JSON.stringify(cpRequests));
-      window.localStorage.setItem('zayro_custom_gifts', JSON.stringify(customGifts));
-      window.localStorage.setItem('zayro_gifts_given_coins', JSON.stringify(userGiftsGivenCoins));
-      window.localStorage.setItem('zayro_received_gifts', JSON.stringify(receivedGiftIds));
-      window.localStorage.setItem('zayro_owned_items', JSON.stringify(ownedItemIds));
-      window.localStorage.setItem('zayro_equipped_items', JSON.stringify(equippedItems));
-      window.localStorage.setItem('zayro_custom_qr', JSON.stringify(customQrUrl));
-      window.localStorage.setItem('zayro_gift_animations', JSON.stringify(giftAnimationsEnabled));
-    } catch {
-      // Ignore storage quota errors cleanly
+    activeRoomIdRef.current = activeRoomId;
+  }, [activeRoomId]);
+
+  useEffect(() => {
+    userSeatIndexRef.current = userSeatIndex;
+  }, [userSeatIndex]);
+
+  useEffect(() => {
+    isMicMutedRef.current = isMicMuted;
+  }, [isMicMuted]);
+
+  // Connect persistent WebSocket hub when authenticated
+  useEffect(() => {
+    if (!isAuthenticated || !userProfile.uid) {
+      ogRealtime.disconnect();
+      return;
     }
+
+    ogRealtime.connect(authToken, userProfile.uid);
+
+    const unsubscribe = ogRealtime.subscribe((msg) => {
+      const type = String(msg.type || '');
+
+      if (type === 'error') {
+        if (msg.message) showToast(String(msg.message));
+        return;
+      }
+
+      if (type === 'welcome') {
+        if (activeRoomIdRef.current) {
+          ogRealtime.send({ type: 'room:join', roomId: activeRoomIdRef.current });
+        }
+        return;
+      }
+
+      if (type === 'room:list-updated') {
+        if (typeof msg.removedRoomId === 'string' && msg.removedRoomId) {
+          const removedId = msg.removedRoomId;
+          setRooms((prev) => prev.filter((r) => r.id !== removedId));
+        }
+        if (roomsRefreshTimerRef.current) {
+          window.clearTimeout(roomsRefreshTimerRef.current);
+        }
+        // Debounce + add jitter (250–900ms) so 500 concurrent clients do not burst /api/rooms simultaneously
+        const jitterMs = 250 + Math.floor(Math.random() * 650);
+        roomsRefreshTimerRef.current = window.setTimeout(() => {
+          roomsRefreshTimerRef.current = null;
+          void apiFetch('/api/rooms')
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d: { ok?: boolean; rooms?: BackendRoomSummary[] } | null) => {
+              if (!d?.ok || !Array.isArray(d.rooms)) return;
+              const currentUid = authenticatedUidRef.current || '';
+              setHasCreatedRoom(d.rooms.some((r) => !r.isOfficial && r.ownerUid === currentUid));
+              setRooms((prev) =>
+                d.rooms!.map((br) =>
+                  mapBackendRoomToVoiceRoom(
+                    br,
+                    currentUid,
+                    prev.find((p) => p.id === br.id)
+                  )
+                )
+              );
+            })
+            .catch(() => {});
+        }, jitterMs);
+        return;
+      }
+
+      if (type === 'room:host-reconnecting') {
+        if (String(msg.roomId || '') === activeRoomIdRef.current) {
+          const secs = Math.max(1, Number(msg.graceSeconds ?? 30));
+          showToast(`Owner connection interrupted. Waiting ${secs}s for reconnection...`);
+        }
+        return;
+      }
+
+      if (type === 'room:host-reconnected') {
+        if (String(msg.roomId || '') === activeRoomIdRef.current) {
+          showToast('Host reconnected. Voice room remains active.');
+        }
+        return;
+      }
+
+      if (type === 'room:admins-updated') {
+        const roomId = String(msg.roomId || '');
+        const nextAdminUids = Array.isArray(msg.adminUids) ? msg.adminUids.map(String) : [];
+        setRooms((prev) =>
+          prev.map((room) => (room.id === roomId ? { ...room, adminUids: nextAdminUids } : room))
+        );
+        return;
+      }
+
+      if (type === 'room:settings-updated') {
+        const roomId = String(msg.roomId || '');
+        const updatedRoom = msg.room as BackendRoomSummary | undefined;
+        if (roomId && updatedRoom) {
+          setRooms((prev) =>
+            prev.map((room) =>
+              room.id === roomId
+                ? mapBackendRoomToVoiceRoom(updatedRoom, authenticatedUidRef.current || '', room)
+                : room
+            )
+          );
+        }
+        return;
+      }
+
+      if (type === 'room:status-changed') {
+        const roomId = String(msg.roomId || '');
+        const nextStatus = msg.status === 'closed' ? 'closed' : 'active';
+        const reason = typeof msg.reason === 'string' ? msg.reason : null;
+        setRooms((prev) =>
+          prev.map((room) =>
+            room.id === roomId
+              ? {
+                  ...room,
+                  status: nextStatus,
+                  closedReason: reason,
+                  seats:
+                    nextStatus === 'closed'
+                      ? room.seats.map((s) => ({
+                          ...s,
+                          occupant: null,
+                          role: 'empty' as const,
+                          isUser: false,
+                          isSpeaking: false,
+                          audioLevel: 0,
+                        }))
+                      : room.seats,
+                }
+              : room
+          )
+        );
+        if (roomId === activeRoomIdRef.current && nextStatus === 'closed') {
+          setUserSeatIndex(null);
+          ogRealtime.setMicMuted(true);
+          setIsLiveMicActive(false);
+        }
+        return;
+      }
+
+      if (type === 'room:action-update') {
+        const roomId = String(msg.roomId || '');
+        const actionRoom = msg.actionRoom as RoomSettingsConfig['actionRoom'] | undefined;
+        if (roomId && actionRoom) {
+          setRooms((prev) =>
+            prev.map((room) =>
+              room.id === roomId
+                ? {
+                    ...room,
+                    roomSettings: { ...(room.roomSettings || {}), actionRoom },
+                  }
+                : room
+            )
+          );
+        }
+        return;
+      }
+
+      if (type === 'room:video-sync') {
+        const roomId = String(msg.roomId || '');
+        if (roomId) {
+          setRoomVideoSync({
+            roomId,
+            sourceType: msg.sourceType === 'local' ? 'local' : 'youtube',
+            youtubeUrl: String(msg.youtubeUrl || ''),
+            playing: Boolean(msg.playing),
+            title: String(msg.title || ''),
+            updatedBy: typeof msg.updatedBy === 'string' ? msg.updatedBy : undefined,
+            ts: Date.now(),
+          });
+        }
+        return;
+      }
+
+      if (type === 'tag:updated') {
+        if (Array.isArray(msg.tags)) {
+          setRelationshipTags(msg.tags as RelationshipTagSummary[]);
+        }
+        if (msg.user) {
+          applyServerUserSnapshot(msg.user as Parameters<typeof applyServerUserSnapshot>[0]);
+        }
+        if (msg.fromName) {
+          showToast(`${String(msg.fromName)} sent you a Relationship Tag invitation!`);
+        }
+        return;
+      }
+
+      if (type === 'room:closed') {
+        const closedId = String(msg.roomId || '');
+        const reason =
+          typeof msg.reason === 'string' && msg.reason.trim()
+            ? msg.reason.trim()
+            : DEFAULT_ROOM_CLOSED_MESSAGE;
+        setRooms((prev) =>
+          prev.map((room) =>
+            room.id === closedId
+              ? {
+                  ...room,
+                  status: 'closed',
+                  closedReason: reason,
+                  seats: room.seats.map((s) => ({
+                    ...s,
+                    occupant: null,
+                    role: 'empty' as const,
+                    isUser: false,
+                    isSpeaking: false,
+                    audioLevel: 0,
+                  })),
+                }
+              : room
+          )
+        );
+        if (activeRoomIdRef.current === closedId) {
+          setUserSeatIndex(null);
+          ogRealtime.setMicMuted(true);
+          setIsLiveMicActive(false);
+        }
+        return;
+      }
+
+      if (
+        type === 'wallet:updated' ||
+        type === 'payment:approved' ||
+        type === 'payment:rejected' ||
+        type === 'user:refresh' ||
+        type === 'event:updated' ||
+        type === 'catalog:updated' ||
+        type === 'tasks:updated'
+      ) {
+        void hydrateBackendState();
+        if (type === 'payment:approved') {
+          soundFx.playVictory();
+          showToast('Payment approved! Coins / VIP have been activated.');
+        } else if (type === 'payment:rejected') {
+          showToast('Payment order rejected. Check your Order Tracker for details.');
+        }
+        return;
+      }
+
+      if (type === 'app:config-updated' && msg.config) {
+        setAppConfig(msg.config as AppConfig);
+        return;
+      }
+
+      if (type === 'announcement:new' || type === 'notification:new') {
+        void apiFetch('/api/notifications')
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (d?.notifications) setNotifications(d.notifications);
+          })
+          .catch(() => {});
+        return;
+      }
+
+      if (type === 'friend:request') {
+        void hydrateBackendState();
+        showToast(`${String(msg.from || 'A player')} sent you a friend request!`);
+        return;
+      }
+
+      if (type === 'friend:accepted') {
+        void hydrateBackendState();
+        showToast(`${String(msg.byName || 'A player')} accepted your friend request!`);
+        return;
+      }
+
+      if (type === 'friend:updated' || type === 'tag:updated') {
+        void hydrateBackendState();
+        return;
+      }
+
+      if (type === 'presence:update') {
+        const targetUid = String(msg.uid || '');
+        const targetPublicId = String(msg.publicId || targetUid);
+        const isOnline = Boolean(msg.online);
+        const lastSeenAt = typeof msg.lastSeenAt === 'string' ? msg.lastSeenAt : null;
+        if (targetUid || targetPublicId) {
+          setFriends((prev) =>
+            prev.map((fr) =>
+              fr.uid === targetUid ||
+              fr.uid === targetPublicId ||
+              fr.publicId === targetUid ||
+              fr.publicId === targetPublicId
+                ? {
+                    ...fr,
+                    online: isOnline,
+                    lastSeenAt: lastSeenAt ?? fr.lastSeenAt,
+                    status: isOnline ? 'Online' : 'Offline',
+                  }
+                : fr
+            )
+          );
+          setChatThreads((prev) =>
+            prev.map((t) =>
+              t.friendUid === targetUid ||
+              t.friendUid === targetPublicId ||
+              t.friendPublicId === targetUid ||
+              t.friendPublicId === targetPublicId
+                ? {
+                    ...t,
+                    online: isOnline,
+                    lastSeenAt: lastSeenAt ?? t.lastSeenAt,
+                    status: isOnline ? 'Online' : 'Offline',
+                  }
+                : t
+            )
+          );
+        }
+        return;
+      }
+
+      if (type === 'cp:proposal') {
+        const cpState = msg.cpState as
+          | { cpPartner?: AvatarConfig['cpPartner']; proposals?: CpRequest[]; history?: CpRelationshipHistoryRecord[] }
+          | undefined;
+        if (cpState?.proposals) setCpRequests(cpState.proposals);
+        if (cpState?.history) setCpRelationshipHistory(cpState.history);
+        showToast(`${String(msg.fromName || 'A player')} sent you a CP Ring proposal (${String(msg.ringName || 'Bond Ring')})!`);
+        return;
+      }
+
+      if (type === 'cp:updated') {
+        const cpState = msg.cpState as
+          | { cpPartner?: AvatarConfig['cpPartner']; proposals?: CpRequest[]; history?: CpRelationshipHistoryRecord[] }
+          | undefined;
+        if (cpState) {
+          setUserProfile((prev) => ({ ...prev, cpPartner: cpState.cpPartner ?? null }));
+          if (Array.isArray(cpState.proposals)) setCpRequests(cpState.proposals);
+          if (Array.isArray(cpState.history)) setCpRelationshipHistory(cpState.history);
+        }
+        if (msg.user) {
+          applyServerUserSnapshot(msg.user as Parameters<typeof applyServerUserSnapshot>[0]);
+        }
+        void hydrateBackendState();
+        if (msg.action === 'accepted') {
+          soundFx.playVictory();
+          showToast('CP Bond accepted and synced across both profiles!');
+        } else if (msg.action === 'broken') {
+          showToast('CP relationship has ended.');
+        } else if (msg.action === 'rejected') {
+          showToast('CP proposal was declined.');
+        }
+        return;
+      }
+
+      if (type === 'dm:message') {
+        const raw = msg.message as
+          | {
+              id?: number | string;
+              senderUid?: string;
+              recipientUid?: string;
+              senderName?: string;
+              body?: string;
+              imageUrl?: string | null;
+              createdAt?: string;
+            }
+          | undefined;
+        if (!raw || !raw.senderUid || !raw.recipientUid) return;
+        const isSelf = raw.senderUid === userProfile.uid;
+        const peerUid = isSelf ? raw.recipientUid : raw.senderUid;
+        const peerName = raw.senderName || 'Player';
+        const ts = raw.createdAt
+          ? new Date(raw.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : 'Now';
+
+        setChatThreads((prev) => {
+          const existing = prev.find((t) => t.friendUid === peerUid);
+          const msgObj = {
+            id: String(raw.id ?? `dm-${Date.now()}`),
+            senderId: raw.senderUid!,
+            senderName: isSelf ? userProfile.name : peerName,
+            text: String(raw.body || (raw.imageUrl ? '📷 Photo' : '')),
+            imageUrl: raw.imageUrl || undefined,
+            timestamp: ts,
+            isSelf,
+            bubbleColor: isSelf ? equippedBubbleColor : undefined,
+          };
+          if (existing) {
+            const already = existing.messages.some((m) => m.id === msgObj.id);
+            if (already) return prev;
+            return prev.map((t) =>
+              t.friendUid === peerUid
+                ? {
+                    ...t,
+                    unread: isSelf ? 0 : t.unread + 1,
+                    messages: [...t.messages, msgObj],
+                  }
+                : t
+            );
+          }
+          return [
+            {
+              friendUid: peerUid,
+              friendName: peerName,
+              avatarId: peerUid,
+              status: 'Online',
+              online: true,
+              unread: isSelf ? 0 : 1,
+              messages: [msgObj],
+            },
+            ...prev,
+          ];
+        });
+        return;
+      }
+
+      if (
+        type === 'room:joined' ||
+        type === 'room:roster-updated' ||
+        type === 'room:participant-joined' ||
+        type === 'room:participant-left'
+      ) {
+        const roomId = String(msg.roomId || '');
+        const participants = (msg.participants as Array<{
+          userUid: string;
+          publicId?: string;
+          name: string;
+          photoUrl?: string | null;
+          equippedFrameId?: string | null;
+          vipLevel: number;
+          seatIndex: number | null;
+          role: 'owner' | 'admin' | 'speaker' | 'listener';
+          isMuted: boolean;
+          isSpeaking: boolean;
+          relationshipTags?: Array<{ partnerUid: string; tagType: string; level: number }>;
+        }>) || [];
+
+        const selfKey = userProfile.publicId || userProfile.uid;
+        const myParticipant = participants.find(
+          (p) => p.userUid === selfKey || p.userUid === userProfile.uid || p.publicId === selfKey
+        );
+        const mySeated = myParticipant ? myParticipant.seatIndex !== null : userSeatIndexRef.current !== null;
+        if (myParticipant) {
+          setUserSeatIndex(myParticipant.seatIndex);
+        }
+
+        if (roomId === activeRoomIdRef.current) {
+          const allUids = participants.map((p) => p.userUid).filter(Boolean);
+          roomParticipantUidsRef.current = allUids;
+          void ogRealtime
+            .syncRoomPeers(roomId, allUids, {
+              seated: mySeated,
+              muted: isMicMutedRef.current,
+            })
+            .then((stream) => {
+              setIsLiveMicActive(Boolean(mySeated && stream));
+            });
+        }
+
+        setRooms((prev) =>
+          prev.map((room) => {
+            if (room.id !== roomId) return room;
+            const seatMap = new Map(participants.filter((p) => p.seatIndex !== null).map((p) => [p.seatIndex!, p]));
+            const nextSeats = room.seats.map((seat) => {
+              const p = seatMap.get(seat.seatIndex);
+              if (!p) {
+                return {
+                  ...seat,
+                  occupant: null,
+                  role: 'empty' as const,
+                  isUser: false,
+                  isSpeaking: false,
+                  audioLevel: 0,
+                  relationshipTags: [],
+                };
+              }
+              const isSelf =
+                p.userUid === userProfile.uid ||
+                p.userUid === userProfile.publicId ||
+                p.publicId === userProfile.publicId;
+              const av: AvatarConfig = isSelf
+                ? { ...userProfile, relationshipTags: p.relationshipTags ?? [] }
+                : {
+                    id: p.userUid,
+                    uid: p.userUid,
+                    publicId: p.publicId,
+                    name: p.name,
+                    handle: `@${p.name.toLowerCase().replace(/\s+/g, '')}`,
+                    photoUrl: p.photoUrl || undefined,
+                    equippedFrameId: p.equippedFrameId ?? null,
+                    relationshipTags: p.relationshipTags ?? [],
+                    skinTone: '#D69E76',
+                    hairColor: '#1E293B',
+                    robeColor: '#7C3AED',
+                    accentColor: '#38BDF8',
+                    ornament: 'crown',
+                  };
+              return {
+                ...seat,
+                occupant: av,
+                role:
+                  p.role === 'owner'
+                    ? ('owner' as const)
+                    : p.role === 'admin'
+                      ? ('admin' as const)
+                      : ('speaker' as const),
+                isUser: isSelf,
+                isMuted: p.isMuted,
+                isSpeaking: p.isSpeaking,
+                audioLevel: p.isSpeaking && !p.isMuted ? 0.4 : 0,
+                vipLevel: Math.min(18, p.vipLevel),
+                relationshipTags: p.relationshipTags ?? [],
+              };
+            });
+
+            const nextListeners: RoomListener[] = participants
+              .filter((p) => p.seatIndex === null)
+              .map((p) => ({
+                uid: p.userUid,
+                name: p.name,
+                avatarId: p.userUid,
+                vipLevel: Math.min(18, p.vipLevel),
+                charm: 0,
+                isMuted: p.isMuted,
+              }));
+
+            const initialMsgs =
+              type === 'room:joined' && Array.isArray(msg.messages)
+                ? (
+                    msg.messages as Array<{
+                      id?: string | number;
+                      senderUid?: string;
+                      senderName?: string;
+                      body?: string;
+                      imageUrl?: string | null;
+                      kind?: string;
+                      createdAt?: string;
+                    }>
+                  ).map((m) => {
+                    const matchedName =
+                      m.senderName ||
+                      participants.find((p) => p.userUid === m.senderUid)?.name ||
+                      (m.senderUid === userProfile.uid ? userProfile.name : 'Member');
+                    return {
+                      id: String(m.id ?? `rm-${Math.random()}`),
+                      senderUid: m.senderUid,
+                      senderName: matchedName,
+                      senderColor: '#38BDF8',
+                      text: String(m.body || ''),
+                      imageUrl: m.imageUrl || undefined,
+                      timestamp: m.createdAt
+                        ? new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                        : 'Now',
+                      kind: (m.kind === 'system' || m.kind === 'gift' || m.kind === 'emote' || m.kind === 'tag'
+                        ? m.kind
+                        : 'chat') as 'chat' | 'system' | 'gift' | 'emote' | 'tag',
+                    };
+                  })
+                : room.messages;
+
+            const joinedStatus =
+              type === 'room:joined' && (msg.roomStatus === 'closed' || msg.roomStatus === 'active')
+                ? (msg.roomStatus as 'active' | 'closed')
+                : room.status;
+            const joinedReason =
+              type === 'room:joined' && msg.closedReason !== undefined
+                ? (msg.closedReason ? String(msg.closedReason) : null)
+                : room.closedReason;
+
+            return {
+              ...room,
+              status: joinedStatus,
+              closedReason: joinedReason,
+              listenerCount: Math.max(1, participants.length),
+              listeners: nextListeners,
+              seats: nextSeats,
+              messages: initialMsgs,
+            };
+          })
+        );
+        return;
+      }
+
+      if (type === 'room:chat') {
+        const roomId = String(msg.roomId || '');
+        const raw = msg.message as
+          | {
+              id?: string | number;
+              senderUid?: string;
+              senderName?: string;
+              vipLevel?: number;
+              body?: string;
+              imageUrl?: string | null;
+              kind?: string;
+              createdAt?: string;
+            }
+          | undefined;
+        if (!raw || (!raw.body && !raw.imageUrl)) return;
+        const msgId = String(raw.id ?? `rc-${Date.now()}`);
+        setRooms((prev) =>
+          prev.map((r) => {
+            if (r.id !== roomId) return r;
+            if (r.messages.some((m) => m.id === msgId)) return r;
+            return {
+              ...r,
+              messages: [
+                ...r.messages,
+                {
+                  id: msgId,
+                  senderUid: raw.senderUid,
+                  senderName: raw.senderName || 'Player',
+                  senderColor: getVipNameColor(Math.min(18, Number(raw.vipLevel ?? 0))),
+                  text: raw.body || (raw.imageUrl ? '📷 Photo' : ''),
+                  imageUrl: raw.imageUrl || undefined,
+                  timestamp: raw.createdAt
+                    ? new Date(raw.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                    : 'Now',
+                  kind: 'chat' as const,
+                },
+              ],
+            };
+          })
+        );
+        return;
+      }
+
+      if (type === 'room:vip-entrance') {
+        const vipLvl = Math.min(18, Number(msg.vipLevel ?? 0));
+        const fullCinematic = Boolean(msg.fullScreenCinematic) || vipLvl >= 15;
+        if (vipEntryTimeoutRef.current) clearTimeout(vipEntryTimeoutRef.current);
+        setVipEntryBanner({
+          name: String(msg.name || 'VIP Guest'),
+          vipLevel: vipLvl,
+          effectId: 'entry-golden-flame',
+          fullScreenCinematic: fullCinematic,
+        });
+        vipEntryTimeoutRef.current = window.setTimeout(
+          () => setVipEntryBanner(null),
+          fullCinematic ? 4800 : 3200
+        );
+        return;
+      }
+
+      if (type === 'room:gift-fx') {
+        const giftObj = msg.gift as VirtualGift | undefined;
+        if (!giftObj || msg.senderUid === userProfile.uid) return;
+        const payload: ActiveGiftEvent = {
+          eventId: `ws-gift-${Date.now()}`,
+          gift: giftObj,
+          senderName: String(msg.senderName || 'Player'),
+          recipientName: String(msg.recipientUid || 'Host'),
+          charmEarned: Number(msg.charmEarned ?? 0),
+          randomCoinsEarned: 0,
+          customMessage: typeof msg.customMessage === 'string' ? msg.customMessage : undefined,
+          isBigGift: Number(giftObj.cost ?? 0) >= 500,
+        };
+        if (giftTimeoutRef.current) clearTimeout(giftTimeoutRef.current);
+        setActiveGiftEvent(payload);
+        giftTimeoutRef.current = window.setTimeout(() => setActiveGiftEvent(null), 3200);
+        if (payload.isBigGift) {
+          if (bigGiftTimeoutRef.current) clearTimeout(bigGiftTimeoutRef.current);
+          setBigGiftBanner(payload);
+          bigGiftTimeoutRef.current = window.setTimeout(() => setBigGiftBanner(null), 5500);
+        }
+        return;
+      }
+
+      if (type === 'room:emote') {
+        const roomId = String(msg.roomId || '');
+        const senderUid = String(msg.userUid || '');
+        const senderPublicId = String(msg.publicId || senderUid);
+        const emoteNumber = Number(msg.emoteNumber ?? 1);
+        const label = String(msg.label || 'Emote');
+        const motion = (msg.motion as EmoteMotion) || 'bounce';
+        const triggeredAt = Number(msg.triggeredAt ?? Date.now());
+        if (!roomId || (!senderUid && !senderPublicId)) return;
+        const nextEmote = { emoteNumber, label, motion, triggeredAt };
+        setRooms((prev) =>
+          prev.map((room) =>
+            room.id === roomId
+              ? {
+                  ...room,
+                  seats: room.seats.map((seat) => {
+                    const occ = seat.occupant;
+                    const matches =
+                      occ &&
+                      (occ.uid === senderUid ||
+                        occ.uid === senderPublicId ||
+                        occ.publicId === senderUid ||
+                        occ.publicId === senderPublicId);
+                    return matches ? { ...seat, activeEmote: nextEmote } : seat;
+                  }),
+                }
+              : room
+          )
+        );
+        if (emoteSeatTimeoutRef.current) {
+          clearTimeout(emoteSeatTimeoutRef.current);
+        }
+        emoteSeatTimeoutRef.current = window.setTimeout(() => {
+          emoteSeatTimeoutRef.current = null;
+          setRooms((prev) =>
+            prev.map((room) =>
+              room.id === roomId
+                ? {
+                    ...room,
+                    seats: room.seats.map((seat) =>
+                      seat.activeEmote?.triggeredAt === triggeredAt
+                        ? { ...seat, activeEmote: undefined }
+                        : seat
+                    ),
+                  }
+                : room
+            )
+          );
+        }, 3200);
+        return;
+      }
+
+      if (type === 'room:kicked') {
+        const kickedRoomId = String(msg.roomId || '');
+        if (kickedRoomId === activeRoomIdRef.current) {
+          stopMicrophone();
+          setUserSeatIndex(null);
+          setActiveRoomId(null);
+          if (typeof window !== 'undefined') {
+            const url = new URL(window.location.href);
+            url.searchParams.delete('room');
+            window.history.replaceState(null, '', url.pathname + url.search);
+          }
+          showToast('You were removed from the voice room.');
+        }
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      ogRealtime.disconnect();
+    };
   }, [
-    rooms,
-    hasCreatedRoom,
-    userProfile,
-    coins,
-    charm,
-    vipGrowth,
-    subscribedVipLevel,
-    friends,
-    cpRequests,
-    customGifts,
-    userGiftsGivenCoins,
-    receivedGiftIds,
-    ownedItemIds,
-    equippedItems,
-    customQrUrl,
-    giftAnimationsEnabled,
+    isAuthenticated,
+    authToken,
+    userProfile.uid,
+    userProfile.name,
+    equippedBubbleColor,
+    hydrateBackendState,
+    apiFetch,
+    showToast,
+    stopMicrophone,
   ]);
+
+  // Periodically prune expired 3-day frames from client view state
+  useEffect(() => {
+    const pruneExpired = () => {
+      const now = Date.now();
+      const expiredIds = Object.entries(ownedItemExpiries)
+        .filter(([, exp]) => exp <= now)
+        .map(([id]) => id);
+      if (expiredIds.length === 0) return;
+
+      setOwnedItemIds((prev) => prev.filter((id) => !expiredIds.includes(id)));
+      setOwnedItemExpiries((prev) => {
+        const next = { ...prev };
+        for (const id of expiredIds) delete next[id];
+        return next;
+      });
+      setEquippedItems((prev) => {
+        const next = { ...prev };
+        for (const cat of Object.keys(next) as ShopCategory[]) {
+          if (next[cat] && expiredIds.includes(next[cat]!)) {
+            delete next[cat];
+          }
+        }
+        return next;
+      });
+    };
+    const timer = window.setInterval(pruneExpired, 60_000);
+    return () => clearInterval(timer);
+  }, [ownedItemExpiries]);
+
+
 
   useEffect(() => {
     return () => {
@@ -330,67 +2260,98 @@ export default function App() {
       if (supportTimeoutRef.current) clearTimeout(supportTimeoutRef.current);
       if (vipEntryTimeoutRef.current) clearTimeout(vipEntryTimeoutRef.current);
       if (emoteSeatTimeoutRef.current) clearTimeout(emoteSeatTimeoutRef.current);
+      if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+      if (roomsRefreshTimerRef.current) clearTimeout(roomsRefreshTimerRef.current);
+      if (exitingRoomTimerRef.current) clearTimeout(exitingRoomTimerRef.current);
     };
   }, [stopMicrophone]);
 
-  // Animate seat voice audio levels
+  // Real-time audio levels from Web Audio AnalyserNode (skips React re-renders when levels haven't changed)
   useEffect(() => {
     if (activeSection !== 'rooms' || !activeRoomId) return;
-    const freqData = new Uint8Array(32);
 
     const intervalId = window.setInterval(() => {
-      let userMicLevel = 0;
-      if (userSeatIndex !== null && !isMicMuted) {
-        if (micAnalyserRef.current) {
-          micAnalyserRef.current.getByteFrequencyData(freqData);
-          const avg = freqData.reduce((a, b) => a + b, 0) / freqData.length;
-          userMicLevel = Math.min(1, avg / 95);
-        } else {
-          userMicLevel = 0.28 + Math.random() * 0.45;
-        }
+      const rawMicLevel = userSeatIndex !== null && !isMicMuted ? ogRealtime.getLocalMicLevel() : 0;
+      const userMicLevel = Math.round(rawMicLevel * 20) / 20;
+      const isUserSpeaking = userSeatIndex !== null && !isMicMuted && userMicLevel > 0.08;
+      if (isUserSpeaking !== prevSpeakingEmitRef.current) {
+        prevSpeakingEmitRef.current = isUserSpeaking;
+        ogRealtime.send({ type: 'room:speaking', isSpeaking: isUserSpeaking });
       }
+      const remoteLevels = ogRealtime.getRemoteAudioLevels();
 
-      setRooms((prevRooms) =>
-        prevRooms.map((room) => {
-          if (room.id !== activeRoomId) return room;
+      setRooms((prevRooms) => {
+        const targetRoom = prevRooms.find((r) => r.id === activeRoomId);
+        if (!targetRoom) return prevRooms;
+
+        let anySeatChanged = false;
+        const nextSeats = targetRoom.seats.map((seat) => {
+          if (!seat.occupant) return seat;
+          if (seat.isUser) {
+            const nextLevel = isMicMuted ? 0 : userMicLevel;
+            const changed =
+              seat.isMuted !== isMicMuted ||
+              seat.isSpeaking !== isUserSpeaking ||
+              Math.abs((seat.audioLevel ?? 0) - nextLevel) >= 0.04 ||
+              seat.vipLevel !== effectiveVipLevel ||
+              seat.charmValue !== charm ||
+              seat.occupant !== userProfile;
+            if (!changed) return seat;
+            anySeatChanged = true;
+            return {
+              ...seat,
+              occupant: userProfile,
+              isMuted: isMicMuted,
+              isSpeaking: isUserSpeaking,
+              audioLevel: nextLevel,
+              vipLevel: effectiveVipLevel,
+              charmValue: charm,
+            };
+          }
+          if (seat.isMuted) {
+            if (!seat.isSpeaking && (seat.audioLevel ?? 0) === 0) return seat;
+            anySeatChanged = true;
+            return { ...seat, isSpeaking: false, audioLevel: 0 };
+          }
+          const peerKey = seat.occupant.publicId || seat.occupant.uid;
+          const rawRemote = remoteLevels[peerKey] ?? remoteLevels[seat.occupant.uid] ?? 0;
+          const liveRemoteLevel = Math.round(rawRemote * 20) / 20;
+          const speakingNow =
+            liveRemoteLevel > 0.08 ||
+            (liveRemoteLevel === 0 && seat.isSpeaking && (seat.audioLevel ?? 0) > 0.08);
+          const nextRemoteLevel = liveRemoteLevel > 0 ? liveRemoteLevel : speakingNow ? 0.25 : 0;
+          if (
+            seat.isSpeaking === speakingNow &&
+            Math.abs((seat.audioLevel ?? 0) - nextRemoteLevel) < 0.04
+          ) {
+            return seat;
+          }
+          anySeatChanged = true;
           return {
-            ...room,
-            seats: room.seats.map((seat) => {
-              if (!seat.occupant) return seat;
-              if (seat.isUser) {
-                return {
-                  ...seat,
-                  occupant: userProfile,
-                  isMuted: isMicMuted,
-                  isSpeaking: !isMicMuted && userMicLevel > 0.14,
-                  audioLevel: isMicMuted ? 0 : userMicLevel,
-                  vipLevel: effectiveVipLevel,
-                  charmValue: charm,
-                };
-              }
-              if (seat.isMuted) {
-                return { ...seat, isSpeaking: false, audioLevel: 0 };
-              }
-              const speakingToggle = Math.random() > 0.72 ? !seat.isSpeaking : seat.isSpeaking;
-              return {
-                ...seat,
-                isSpeaking: speakingToggle,
-                audioLevel: speakingToggle ? 0.35 + Math.random() * 0.55 : 0.08,
-              };
-            }),
+            ...seat,
+            isSpeaking: speakingNow,
+            audioLevel: nextRemoteLevel,
           };
-        })
-      );
-    }, 180);
+        });
+
+        if (!anySeatChanged) return prevRooms;
+        return prevRooms.map((room) =>
+          room.id === activeRoomId ? { ...room, seats: nextSeats } : room
+        );
+      });
+    }, 150);
 
     return () => clearInterval(intervalId);
   }, [activeSection, activeRoomId, userSeatIndex, isMicMuted, userProfile, effectiveVipLevel, charm]);
 
-  // PK Countdown Timer
+  // PK Countdown Timer (no-op fast path when no PK is running)
   useEffect(() => {
     const pkTimer = window.setInterval(() => {
-      setRooms((prev) =>
-        prev.map((room) => {
+      setRooms((prev) => {
+        if (!prev.some((r) => r.pkState?.active && r.pkState?.running)) {
+          return prev;
+        }
+        return prev.map((room) => {
           const pk = room.pkState;
           if (!pk || !pk.active || !pk.running) return room;
           if (pk.secondsLeft <= 1) {
@@ -420,83 +2381,128 @@ export default function App() {
             ...room,
             pkState: { ...pk, secondsLeft: pk.secondsLeft - 1 },
           };
-        })
-      );
+        });
+      });
     }, 1000);
     return () => clearInterval(pkTimer);
   }, []);
 
-  const handleLogin = ({
-    provider,
-    name,
-    identifier,
-  }: {
-    provider: AuthProvider;
-    name: string;
-    identifier: string;
-  }) => {
-    const cleanEmail = identifier.includes('@') ? identifier.trim() : '';
-    setUserProfile((prev) => ({
-      ...prev,
-      name: name.trim() || prev.name,
-      handle: `@${(name.trim() || 'sabir').toLowerCase().replace(/\s+/g, '')}.${provider}`,
-      email: cleanEmail || prev.email,
-    }));
+  const handleVerifyFirebaseUser = useCallback(
+    (fbUser: User, preferredProvider?: AuthProvider) =>
+      verifyFirebaseUserPayload(fbUser, { forceRefresh: true, preferredProvider }),
+    [verifyFirebaseUserPayload]
+  );
 
-    const today = getTodayDateKey();
-    let lastLoginDate: string | null = null;
-    try {
-      lastLoginDate = window.localStorage.getItem('zayro_daily_login_date');
-    } catch {
-      lastLoginDate = null;
+  const handleLogin = (payload: VerifiedLoginPayload) => {
+    if (!payload.token || !payload.uid) {
+      return;
     }
-    if (lastLoginDate !== today) {
-      setCoins((prev) => prev + 100_000);
-      setDailyLoginClaimed(true);
-      try {
-        window.localStorage.setItem('zayro_daily_login_date', today);
-      } catch {
-        // Ignore storage error
-      }
-    }
-
-    setIsAuthenticated(true);
-    setActiveSection('home');
+    applyVerifiedPayloadToApp(payload);
     soundFx.playVictory();
+  };
+
+  const handleLogout = async () => {
+    isLoggingOutRef.current = true;
+    isAuthenticatedRef.current = false;
+    authenticatedUidRef.current = null;
+    try {
+      await syncOwnFirestorePresenceAndProfile({
+        publicId: userProfile.publicId || userProfile.uid,
+        name: userProfile.name,
+        handle: userProfile.handle,
+        photoUrl: userProfile.photoUrl ?? null,
+        equippedFrameId: equippedItems.frame ?? null,
+        vipLevel: vipStatus === 'Active' ? subscribedVipLevel : 0,
+        online: false,
+        email: userProfile.email ?? null,
+      });
+    } catch {
+      // Best-effort offline sync
+    }
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+      });
+    } catch {
+      // Ignore network errors during logout cleanup
+    }
+    try {
+      if (auth) await signOut(auth);
+    } catch {
+      // Ignore Firebase signOut error
+    } finally {
+      isLoggingOutRef.current = false;
+    }
+    ogRealtime.disconnect();
+    pendingRoomLinkRef.current = null;
+    pendingRoomJoinIdRef.current = null;
+    exitingRoomIdRef.current = null;
+    setClosedRoomNotice(null);
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('room');
+      window.history.replaceState(null, '', url.pathname + url.search);
+    }
+    setActiveRoomId(null);
+    setUserSeatIndex(null);
+    setAuthToken(null);
+    setVerifiedEmail(null);
+    setAuthError(null);
+    setUserRole('normal_user');
+    setIsAdminRoute(false);
+    setCoins(0);
+    setCharm(0);
+    setVipGrowth(0);
+    setSubscribedVipLevel(0);
+    setVipStatus('Not Active');
+    setVipLabel(null);
+    setGiftsReceivedCount(0);
+    setOrders([]);
+    setWalletTransactions([]);
+    setOwnedItemIds([]);
+    setOwnedItemExpiries({});
+    setEquippedItems({});
+    setFriends([]);
+    setOutgoingPendingFriendUids([]);
+    setPendingFriendRequests([]);
+    setChatThreads([]);
+    setMoments([]);
+    setSharedMoments([]);
+    setIsAuthenticated(false);
+    setActiveSection('home');
   };
 
   const handleJoinSeat = async (seatIndex: number) => {
     if (!activeRoomId) return;
     const targetRoom = rooms.find((r) => r.id === activeRoomId);
     if (!targetRoom) return;
-    if (seatIndex === 0 && targetRoom.ownerUid !== userProfile.uid) return;
+    if (targetRoom.status === 'closed') {
+      showToast('Room is closed until the Owner or Room Admin enters.');
+      return;
+    }
+    const isRoomOwner = targetRoom.ownerUid === userProfile.uid || targetRoom.ownerUid === userProfile.publicId;
+    if (seatIndex === 0 && !isRoomOwner) return;
+    if (isRoomOwner && seatIndex !== 0) return;
     const targetSeat = targetRoom.seats.find((s) => s.seatIndex === seatIndex);
     if (!targetSeat || targetSeat.isLocked || targetSeat.occupant) return;
 
     soundFx.playMove();
     setUserSeatIndex(seatIndex);
     setIsMicMuted(false);
-    advanceDailyTask('dt-1');
+    ogRealtime.send({ type: 'room:seat-take', seatIndex });
 
-    if (navigator.mediaDevices?.getUserMedia && !micStreamRef.current) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        micStreamRef.current = stream;
-        const AudioCtx =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const ctx = new AudioCtx();
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 64;
-        source.connect(analyser);
-        micAudioCtxRef.current = ctx;
-        micAnalyserRef.current = analyser;
-        setIsLiveMicActive(true);
-      } catch {
-        setIsLiveMicActive(false);
-      }
-    }
+    const seatPeerUids = targetRoom.seats
+      .map((s) => s.occupant?.publicId || s.occupant?.uid)
+      .filter((id): id is string => Boolean(id && id !== userProfile.uid && id !== userProfile.publicId));
+    const allPeerUids = Array.from(new Set([...roomParticipantUidsRef.current, ...seatPeerUids]));
+
+    const stream = await ogRealtime.syncRoomPeers(activeRoomId, allPeerUids, {
+      seated: true,
+      muted: false,
+    });
+    setIsLiveMicActive(Boolean(stream));
 
     setRooms((prev) =>
       prev.map((room) => {
@@ -521,8 +2527,8 @@ export default function App() {
                 role: seat.seatIndex === 0 ? 'owner' : 'speaker',
                 isUser: true,
                 isMuted: false,
-                isSpeaking: true,
-                audioLevel: 0.45,
+                isSpeaking: false,
+                audioLevel: 0,
                 vipLevel: effectiveVipLevel,
                 charmValue: charm,
               };
@@ -534,109 +2540,225 @@ export default function App() {
     );
   };
 
-  const handleLeaveSeat = useCallback(() => {
-    stopMicrophone();
-    setUserSeatIndex(null);
-    if (!activeRoomId) return;
-    setRooms((prev) =>
-      prev.map((room) => {
-        if (room.id !== activeRoomId) return room;
-        return {
-          ...room,
-          seats: room.seats.map((seat) =>
-            seat.isUser
-              ? {
-                  ...seat,
-                  occupant: null,
-                  role: 'empty',
-                  isUser: false,
-                  isSpeaking: false,
-                  audioLevel: 0,
-                }
-              : seat
-          ),
-        };
-      })
-    );
-  }, [activeRoomId, stopMicrophone]);
-
-  const enterRoomDirect = (roomId: string) => {
-    if (activeRoomId && activeRoomId !== roomId) {
-      handleLeaveSeat();
-    }
-    setActiveRoomId(roomId);
-    const targetRoom = rooms.find((r) => r.id === roomId);
-    const isOwnerEntering = targetRoom?.ownerUid === userProfile.uid;
-
-    if (isOwnerEntering && targetRoom) {
-      // Owner's Seat (Seat 0) is permanent — automatically seat the Room Owner upon entering
+  const handleLeaveSeat = useCallback(
+    (allowOwnerVacate = false) => {
+      if (!allowOwnerVacate && activeRoomId) {
+        const current = rooms.find((r) => r.id === activeRoomId);
+        if (current?.ownerUid === userProfile.uid) return;
+      }
+      if (!allowOwnerVacate) {
+        ogRealtime.send({ type: 'room:seat-leave' });
+      }
+      stopMicrophone();
+      setUserSeatIndex(null);
+      if (!activeRoomId) return;
       setRooms((prev) =>
         prev.map((room) => {
-          if (room.id !== roomId) return room;
+          if (room.id !== activeRoomId) return room;
           return {
             ...room,
-            seats: room.seats.map((seat) => {
-              if (seat.seatIndex === 0) {
-                return {
-                  ...seat,
-                  occupant: userProfile,
-                  role: 'owner',
-                  isUser: true,
-                  isLocked: false,
-                  isMuted: isMicMuted,
-                  isSpeaking: !isMicMuted,
-                  audioLevel: isMicMuted ? 0 : 0.45,
-                  vipLevel: effectiveVipLevel,
-                  charmValue: charm,
-                };
-              }
-              if (seat.isUser || seat.occupant?.uid === userProfile.uid) {
-                return {
-                  ...seat,
-                  occupant: null,
-                  role: 'empty',
-                  isUser: false,
-                  isSpeaking: false,
-                  audioLevel: 0,
-                };
-              }
-              return seat;
-            }),
+            seats: room.seats.map((seat) =>
+              seat.isUser
+                ? {
+                    ...seat,
+                    occupant: null,
+                    role: 'empty',
+                    isUser: false,
+                    isSpeaking: false,
+                    audioLevel: 0,
+                  }
+                : seat
+            ),
           };
         })
       );
-      setUserSeatIndex(0);
+    },
+    [activeRoomId, rooms, stopMicrophone, userProfile.uid]
+  );
+
+  const setRoomUrlParam = useCallback((roomId: string | null) => {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    if (roomId) {
+      url.searchParams.set('room', roomId);
     } else {
-      const existingSeat = targetRoom?.seats.find(
-        (s) => s.isUser || s.occupant?.uid === userProfile.uid
-      );
-      setUserSeatIndex(existingSeat ? existingSeat.seatIndex : null);
+      url.searchParams.delete('room');
     }
+    window.history.replaceState(null, '', url.pathname + url.search);
+  }, []);
 
-    advanceDailyTask('dt-1');
-    if (speakerEnabled) {
-      soundFx.playMove();
-    }
+  const enterRoomDirect = useCallback(
+    (roomId: string) => {
+      if (activeRoomId && activeRoomId !== roomId) {
+        handleLeaveSeat(true);
+        ogRealtime.send({ type: 'room:leave' });
+        void apiFetch(`/api/rooms/${encodeURIComponent(activeRoomId)}/leave`, { method: 'POST' }).catch(() => {});
+      }
+      exitingRoomIdRef.current = null;
+      pendingRoomJoinIdRef.current = roomId;
+      setClosedRoomNotice(null);
+      setActiveRoomId(roomId);
+      setRoomUrlParam(roomId);
+      ogRealtime.send({ type: 'room:join', roomId });
+      const targetRoom = rooms.find((r) => r.id === roomId);
+      const isOwnerEntering = targetRoom?.ownerUid === userProfile.uid;
 
-    if (vipEntryTimeoutRef.current) clearTimeout(vipEntryTimeoutRef.current);
-    setVipEntryBanner({
-      name: userProfile.name,
-      vipLevel: effectiveVipLevel,
-      effectId: equippedItems.entry || 'entry-golden-flame',
-    });
-    vipEntryTimeoutRef.current = window.setTimeout(() => {
-      setVipEntryBanner(null);
-    }, 3200);
-  };
+      if (isOwnerEntering && targetRoom) {
+        setRooms((prev) =>
+          prev.map((room) => {
+            if (room.id !== roomId) return room;
+            return {
+              ...room,
+              seats: room.seats.map((seat) => {
+                if (seat.seatIndex === 0) {
+                  return {
+                    ...seat,
+                    occupant: userProfile,
+                    role: 'owner',
+                    isUser: true,
+                    isLocked: false,
+                    isMuted: isMicMuted,
+                    isSpeaking: !isMicMuted,
+                    audioLevel: isMicMuted ? 0 : 0.45,
+                    vipLevel: effectiveVipLevel,
+                    charmValue: charm,
+                  };
+                }
+                if (seat.isUser || seat.occupant?.uid === userProfile.uid) {
+                  return {
+                    ...seat,
+                    occupant: null,
+                    role: 'empty',
+                    isUser: false,
+                    isSpeaking: false,
+                    audioLevel: 0,
+                  };
+                }
+                return seat;
+              }),
+            };
+          })
+        );
+        setUserSeatIndex(0);
+      } else {
+        const existingSeat = targetRoom?.seats.find(
+          (s) => s.isUser || s.occupant?.uid === userProfile.uid
+        );
+        setUserSeatIndex(existingSeat ? existingSeat.seatIndex : null);
+      }
+
+      if (speakerEnabled) {
+        soundFx.playMove();
+      }
+
+      if (vipEntryTimeoutRef.current) clearTimeout(vipEntryTimeoutRef.current);
+      const isFullCinematic = effectiveVipLevel >= 15;
+      setVipEntryBanner({
+        name: userProfile.name,
+        vipLevel: effectiveVipLevel,
+        effectId: equippedItems.entry || 'entry-golden-flame',
+        fullScreenCinematic: isFullCinematic,
+      });
+      vipEntryTimeoutRef.current = window.setTimeout(() => {
+        setVipEntryBanner(null);
+      }, isFullCinematic ? 4800 : 3200);
+    },
+    [
+      activeRoomId,
+      apiFetch,
+      charm,
+      effectiveVipLevel,
+      equippedItems.entry,
+      handleLeaveSeat,
+      isMicMuted,
+      rooms,
+      setRoomUrlParam,
+      speakerEnabled,
+      userProfile,
+    ]
+  );
+
+  const openRoomByIdOrLink = useCallback(
+    async (roomIdOrCode: string): Promise<boolean> => {
+      const cleanId = roomIdOrCode.trim();
+      if (!cleanId) return false;
+      try {
+        const resp = await apiFetch(`/api/rooms/${encodeURIComponent(cleanId)}`);
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          closed?: boolean;
+          roomId?: string;
+          roomTitle?: string;
+          reason?: string;
+          error?: string;
+          room?: BackendRoomSummary;
+        };
+
+        if (!resp.ok || !data.ok || !data.room) {
+          setRoomUrlParam(null);
+          showToast(data.error || 'Voice room could not be found.');
+          setActiveSection('rooms');
+          return false;
+        }
+
+        const mapped = mapBackendRoomToVoiceRoom(
+          data.room,
+          userProfile.uid,
+          rooms.find((r) => r.id === data.room!.id)
+        );
+        setRooms((prev) => {
+          const exists = prev.some((r) => r.id === mapped.id);
+          return exists ? prev.map((r) => (r.id === mapped.id ? mapped : r)) : [mapped, ...prev];
+        });
+
+        const isOwnerOrAdmin =
+          mapped.ownerUid === userProfile.uid ||
+          mapped.ownerUid === userProfile.publicId ||
+          mapped.adminUids.includes(userProfile.uid);
+        if (
+          mapped.isRoomLocked &&
+          (mapped.hasPasscode || mapped.roomPasscode) &&
+          !isOwnerOrAdmin &&
+          !unlockedRoomIds.includes(mapped.id)
+        ) {
+          setClosedRoomNotice(null);
+          setPendingLockedRoomId(mapped.id);
+          setPinEntry('');
+          setPinError('');
+          return false;
+        }
+
+        enterRoomDirect(mapped.id);
+        setActiveSection('rooms');
+        return true;
+      } catch {
+        showToast('Unable to verify voice room status right now.');
+        return false;
+      }
+    },
+    [apiFetch, enterRoomDirect, rooms, setRoomUrlParam, showToast, unlockedRoomIds, userProfile.publicId, userProfile.uid]
+  );
+
+  useEffect(() => {
+    if (!isAuthenticated || !pendingRoomLinkRef.current) return;
+    const requested = pendingRoomLinkRef.current;
+    pendingRoomLinkRef.current = null;
+    void openRoomByIdOrLink(requested);
+  }, [isAuthenticated, openRoomByIdOrLink]);
 
   const handleSelectRoom = (roomId: string): boolean => {
     const targetRoom = rooms.find((r) => r.id === roomId);
+    if (!targetRoom) {
+      void openRoomByIdOrLink(roomId);
+      return false;
+    }
     const isOwnerOrAdmin =
-      targetRoom?.ownerUid === userProfile.uid ||
-      Boolean(targetRoom?.adminUids.includes(userProfile.uid));
+      targetRoom.ownerUid === userProfile.uid ||
+      targetRoom.ownerUid === userProfile.publicId ||
+      Boolean(targetRoom.adminUids.includes(userProfile.uid));
     if (
-      targetRoom?.isRoomLocked &&
-      targetRoom.roomPasscode &&
+      targetRoom.isRoomLocked &&
+      (targetRoom.hasPasscode || targetRoom.roomPasscode) &&
       !isOwnerOrAdmin &&
       !unlockedRoomIds.includes(roomId)
     ) {
@@ -649,38 +2771,121 @@ export default function App() {
     return true;
   };
 
-  const handleUnlockRoomSubmit = (e: React.FormEvent) => {
+  const handleUnlockRoomSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pendingLockedRoomId) return;
-    const targetRoom = rooms.find((r) => r.id === pendingLockedRoomId);
+    const id = pendingLockedRoomId;
+    const targetRoom = rooms.find((r) => r.id === id);
     if (!targetRoom) {
       setPendingLockedRoomId(null);
       return;
     }
-    if (pinEntry === targetRoom.roomPasscode) {
-      const id = pendingLockedRoomId;
+    if (targetRoom.roomPasscode && pinEntry === targetRoom.roomPasscode) {
       setUnlockedRoomIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
       setPendingLockedRoomId(null);
       setPinEntry('');
       setPinError('');
       enterRoomDirect(id);
       setActiveSection('rooms');
-    } else {
-      setPinError('Incorrect 4-digit passcode. Please try again.');
+      return;
+    }
+    try {
+      const resp = await apiFetch(`/api/rooms/${encodeURIComponent(id)}/verify-passcode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode: pinEntry }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!resp.ok || !data.ok) {
+        setPinError(data.error || 'Incorrect 4-digit passcode. Please try again.');
+        return;
+      }
+      setUnlockedRoomIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+      setPendingLockedRoomId(null);
+      setPinEntry('');
+      setPinError('');
+      enterRoomDirect(id);
+      setActiveSection('rooms');
+    } catch {
+      setPinError('Unable to verify room passcode.');
     }
   };
 
   const handleExitRoom = () => {
     const exitingId = activeRoomId;
-    handleLeaveSeat();
     if (exitingId) {
+      exitingRoomIdRef.current = exitingId;
+      if (exitingRoomTimerRef.current) {
+        window.clearTimeout(exitingRoomTimerRef.current);
+      }
+      exitingRoomTimerRef.current = window.setTimeout(() => {
+        exitingRoomTimerRef.current = null;
+        if (exitingRoomIdRef.current === exitingId) {
+          exitingRoomIdRef.current = null;
+        }
+      }, 4000);
+    }
+    handleLeaveSeat(true);
+    ogRealtime.send({ type: 'room:leave' });
+    if (exitingId) {
+      void apiFetch(`/api/rooms/${encodeURIComponent(exitingId)}/leave`, { method: 'POST' })
+        .then(() =>
+          apiFetch('/api/rooms')
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d: { ok?: boolean; rooms?: BackendRoomSummary[] } | null) => {
+              if (!d?.ok || !Array.isArray(d.rooms)) return;
+              const currentUid = authenticatedUidRef.current || '';
+              setRooms((prev) =>
+                d.rooms!.map((br) =>
+                  mapBackendRoomToVoiceRoom(
+                    br,
+                    currentUid,
+                    prev.find((p) => p.id === br.id)
+                  )
+                )
+              );
+            })
+        )
+        .catch(() => {});
       setRooms((prev) =>
         prev.map((room) => (room.id === exitingId ? { ...room, messages: [] } : room))
       );
     }
+    pendingRoomJoinIdRef.current = null;
+    setRoomUrlParam(null);
+    setClosedRoomNotice(null);
     setActiveRoomId(null);
     setVipEntryBanner(null);
     soundFx.playMove();
+  };
+
+  const handleDismissClosedRoomNotice = () => {
+    setClosedRoomNotice(null);
+    setRoomUrlParam(null);
+    void hydrateBackendState();
+  };
+
+  const handleReopenRoom = async (roomId: string) => {
+    try {
+      const resp = await apiFetch(`/api/rooms/${encodeURIComponent(roomId)}/reopen`, {
+        method: 'POST',
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+      };
+      if (!resp.ok || !data.ok) {
+        showToast(data.error || 'Could not reopen voice room.');
+        return;
+      }
+      setClosedRoomNotice(null);
+      await hydrateBackendState();
+      enterRoomDirect(roomId);
+      setActiveSection('rooms');
+      soundFx.playVictory();
+    } catch {
+      showToast('Network error reopening voice room.');
+    }
   };
 
   const handleToggleRoomMember = (roomId: string) => {
@@ -703,11 +2908,13 @@ export default function App() {
     roomId: string,
     updates: {
       title?: string;
+      category?: VoiceRoom['category'];
       dpUrl?: string;
       bgThemeId?: string;
       bgUrl?: string;
       isRoomLocked?: boolean;
       roomPasscode?: string;
+      roomSettings?: Partial<RoomSettingsConfig>;
     }
   ) => {
     const foundTheme = updates.bgThemeId
@@ -716,12 +2923,18 @@ export default function App() {
     setRooms((prev) =>
       prev.map((room) => {
         if (room.id !== roomId) return room;
-        const canEdit =
-          room.ownerUid === userProfile.uid || room.adminUids.includes(userProfile.uid);
+        const canEdit = room.isOfficial
+          ? ADMIN_ROLES.has(userRole)
+          : room.ownerUid === userProfile.uid || room.adminUids.includes(userProfile.uid);
         if (!canEdit) return room;
+        const mergedSettings: RoomSettingsConfig | undefined = updates.roomSettings
+          ? { ...(room.roomSettings || {}), ...updates.roomSettings }
+          : room.roomSettings;
         return {
           ...room,
           title: updates.title ?? room.title,
+          category: updates.category ?? room.category,
+          tags: updates.category ? [updates.category] : room.tags,
           dpUrl: updates.dpUrl !== undefined ? updates.dpUrl : room.dpUrl,
           bgThemeId: updates.bgThemeId ?? room.bgThemeId,
           bgUrl: updates.bgUrl !== undefined ? updates.bgUrl || undefined : room.bgUrl,
@@ -730,55 +2943,99 @@ export default function App() {
             updates.isRoomLocked !== undefined ? updates.isRoomLocked : room.isRoomLocked,
           roomPasscode:
             updates.roomPasscode !== undefined ? updates.roomPasscode : room.roomPasscode,
+          roomSettings: mergedSettings,
         };
       })
     );
+    void apiFetch(`/api/rooms/${encodeURIComponent(roomId)}/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    })
+      .then(async (r) => {
+        if (!r.ok) return;
+        const payload = (await r.json()) as { room?: BackendRoomSummary };
+        if (payload?.room) {
+          setRooms((prev) =>
+            prev.map((rm) =>
+              rm.id === roomId ? mapBackendRoomToVoiceRoom(payload.room!, userProfile.uid, rm) : rm
+            )
+          );
+        }
+      })
+      .catch(() => {});
     soundFx.playMove();
   };
 
   const handleToggleAdmin = (roomId: string, targetUid: string, targetName: string) => {
     const now = new Date();
     const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    setRooms((prev) =>
-      prev.map((room) => {
-        if (room.id !== roomId) return room;
-        if (room.ownerUid !== userProfile.uid || targetUid === room.ownerUid) return room;
+    const targetRoom = rooms.find((r) => r.id === roomId);
+    if (!targetRoom || targetRoom.ownerUid !== userProfile.uid || targetUid === targetRoom.ownerUid) {
+      return;
+    }
+    const isCurrentlyAdmin = targetRoom.adminUids.includes(targetUid);
+    const maxAdmins = getAdminSlotCount(targetRoom.level);
+    if (!isCurrentlyAdmin && targetRoom.adminUids.length >= maxAdmins) {
+      showToast(`Maximum ${maxAdmins} Admin slots reached.`);
+      return;
+    }
 
-        const isCurrentlyAdmin = room.adminUids.includes(targetUid);
-        const maxAdmins = getAdminSlotCount(room.level);
-        if (!isCurrentlyAdmin && room.adminUids.length >= maxAdmins) {
-          return room;
-        }
-
-        const nextAdminUids = isCurrentlyAdmin
-          ? room.adminUids.filter((id) => id !== targetUid)
-          : [...room.adminUids, targetUid];
-
-        return {
-          ...room,
-          adminUids: nextAdminUids,
-          seats: room.seats.map((seat) =>
-            seat.occupant?.uid === targetUid
-              ? { ...seat, role: isCurrentlyAdmin ? 'speaker' : 'admin' }
-              : seat
-          ),
-          messages: [
-            ...room.messages,
-            {
-              id: `sys-adm-${Date.now()}`,
-              senderName: 'System',
-              senderColor: '#38BDF8',
-              text: isCurrentlyAdmin
-                ? `${targetName} was removed from Room Admin.`
-                : `${targetName} was appointed as Room Admin.`,
-              timestamp,
-              kind: 'system',
-            },
-          ],
+    void (async () => {
+      try {
+        const resp = await apiFetch(`/api/rooms/${encodeURIComponent(roomId)}/admins/toggle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetUid }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          adminUids?: string[];
+          isAdmin?: boolean;
+          error?: string;
         };
-      })
-    );
-    soundFx.playVictory();
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Could not update Room Admin.');
+          return;
+        }
+        const nextAdminUids = Array.isArray(data.adminUids)
+          ? data.adminUids
+          : isCurrentlyAdmin
+            ? targetRoom.adminUids.filter((id) => id !== targetUid)
+            : [...targetRoom.adminUids, targetUid];
+        const granted = Boolean(data.isAdmin);
+        setRooms((prev) =>
+          prev.map((room) => {
+            if (room.id !== roomId) return room;
+            return {
+              ...room,
+              adminUids: nextAdminUids,
+              seats: room.seats.map((seat) =>
+                seat.occupant?.uid === targetUid
+                  ? { ...seat, role: granted ? 'admin' : 'speaker' }
+                  : seat
+              ),
+              messages: [
+                ...room.messages,
+                {
+                  id: `sys-adm-${Date.now()}`,
+                  senderName: 'System',
+                  senderColor: '#38BDF8',
+                  text: granted
+                    ? `${targetName} was appointed as Room Admin.`
+                    : `${targetName} was removed from Room Admin.`,
+                  timestamp,
+                  kind: 'system',
+                },
+              ],
+            };
+          })
+        );
+        soundFx.playVictory();
+      } catch {
+        showToast('Network error updating Room Admin.');
+      }
+    })();
   };
 
   const handleKickUser = (roomId: string, targetUid: string, targetName: string) => {
@@ -854,8 +3111,8 @@ export default function App() {
 
         const matchedAvatar: AvatarConfig = isSelf
           ? userProfile
-          : AVATAR_ROSTER.find((a) => a.uid === listener.uid || a.id === listener.avatarId) ?? {
-              id: listener.avatarId,
+          : {
+              id: listener.avatarId || listener.uid,
               uid: listener.uid,
               name: listener.name,
               handle: `@${listener.name.toLowerCase().replace(/\s+/g, '')}`,
@@ -982,31 +3239,13 @@ export default function App() {
 
   const handleSendMessage = (text: string, imageUrl?: string) => {
     if (!activeRoomId) return;
-    const now = new Date();
-    const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    setRooms((prev) =>
-      prev.map((room) =>
-        room.id === activeRoomId
-          ? {
-              ...room,
-              messages: [
-                ...room.messages,
-                {
-                  id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-                  senderUid: userProfile.uid,
-                  senderName: userProfile.name,
-                  senderColor: equippedRingColor || getVipNameColor(effectiveVipLevel),
-                  bubbleColor: equippedBubbleColor,
-                  text,
-                  imageUrl,
-                  timestamp,
-                  kind: 'chat',
-                },
-              ],
-            }
-          : room
-      )
-    );
+    const clean = text.trim();
+    if (!clean && !imageUrl) return;
+    ogRealtime.send({
+      type: 'room:chat',
+      text: clean || (imageUrl ? '📷 Photo' : ''),
+      imageUrl,
+    });
     soundFx.playMove();
   };
 
@@ -1014,13 +3253,22 @@ export default function App() {
   const handleSendEmote = (
     emoteNumber: number,
     label: string,
-    _symbol: string,
+    symbol: string,
     motion: EmoteMotion
   ) => {
     const triggeredAt = Date.now();
     const nextEmote = { emoteNumber, label, motion, triggeredAt };
 
     if (activeRoomId) {
+      ogRealtime.send({
+        type: 'room:emote',
+        emoteNumber,
+        label,
+        symbol,
+        motion,
+        triggeredAt,
+      });
+
       setRooms((prev) =>
         prev.map((room) =>
           room.id === activeRoomId
@@ -1048,7 +3296,7 @@ export default function App() {
             ),
           }))
         );
-      }, 4500);
+      }, 3200);
     }
 
     soundFx.playBeat(true);
@@ -1110,7 +3358,7 @@ export default function App() {
     []
   );
 
-  // Sending a gift grants Charm, Random Coins, VIP Growth, Room EXP & triggers Big Gift broadcast
+  // Sending a gift executes atomically on the backend (PostgreSQL FOR UPDATE + Gift FX broadcast)
   const handleSendGift = (
     gift: VirtualGift,
     recipientName: string,
@@ -1120,206 +3368,126 @@ export default function App() {
   ) => {
     const qty = Math.max(1, quantity);
     const totalCost = gift.cost * qty;
-    if (coins < totalCost) return;
+    if (coins < totalCost) {
+      showToast('Insufficient coins balance.');
+      return;
+    }
 
     const cleanMessage = customMessage?.trim().slice(0, 30) || undefined;
-    const isBigGift = totalCost >= 500 || gift.rarity !== 'Standard' || Boolean(cleanMessage);
-
-    const charmEarned = gift.charmValue * qty;
-    const singleRandom =
-      gift.randomCoinsMin +
-      Math.floor(Math.random() * (gift.randomCoinsMax - gift.randomCoinsMin + 1));
-    const randomCoinsEarned = singleRandom * qty;
-    const roomExpEarned = Math.max(1, Math.round(totalCost / 10));
-
-    setCoins((prev) => prev - totalCost + randomCoinsEarned);
-    setCharm((prev) => prev + charmEarned);
-    setUserGiftsGivenCoins((prev) => prev + totalCost);
-    applyCoinSpend(totalCost);
-    soundFx.playGiftFanfare(gift.rarity);
-
-    advanceDailyTask('dt-2');
-    setRoomTasks((prev) =>
-      prev.map((rt) =>
-        rt.id === 'rt-gift'
-          ? { ...rt, progress: Math.min(rt.target, rt.progress + roomExpEarned) }
-          : rt
-      )
-    );
-
-    setReceivedGiftIds((prev) => (prev.includes(gift.id) ? prev : [...prev, gift.id]));
-
-    // Advance CP Level & Charms when gifting to connected CP Partner
-    if (
-      userProfile.cpPartner &&
-      ((recipientUid && recipientUid === userProfile.cpPartner.partnerUid) ||
-        recipientName.toLowerCase() === userProfile.cpPartner.partnerName.toLowerCase())
-    ) {
-      setUserProfile((prev) => {
-        if (!prev.cpPartner) return prev;
-        const nextCpCharm = (prev.cpPartner.cpCharm ?? 0) + charmEarned;
-        const cpLevelInfo = getCpLevelInfo(nextCpCharm);
-        return {
-          ...prev,
-          cpPartner: {
-            ...prev.cpPartner,
-            cpCharm: nextCpCharm,
-            cpLevel: cpLevelInfo.level,
-          },
-        };
-      });
-    }
-
-    // Ring / Diamond Ring gift automatically sends a CP Ring proposal request to the recipient
-    if (
-      (gift.id === 'ring' || gift.id === 'diamond-ring') &&
-      recipientUid &&
-      recipientUid !== userProfile.uid
-    ) {
-      const matched = AVATAR_ROSTER.find((a) => a.uid === recipientUid);
-      const ringNum = gift.id === 'diamond-ring' ? 8 : 1;
-      handleProposeCp(
-        recipientUid,
-        recipientName,
-        matched?.id ?? AVATAR_ROSTER[0].id,
-        ringNum,
-        gift.name
-      );
-    }
-
-    if (recipientName.toLowerCase() === intimateSpace.partnerName.toLowerCase()) {
-      setIntimateSpace((prev) => ({
-        ...prev,
-        progress: Math.min(prev.target, prev.progress + charmEarned),
-      }));
-    }
-
-    const now = new Date();
-    const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-
+    const resolvedRecipientUid = recipientUid || userProfile.uid;
     const targetRoomId = activeRoomId ?? rooms[0]?.id;
-    if (targetRoomId) {
-      setRooms((prev) =>
-        prev.map((room) => {
-          if (room.id !== targetRoomId) return room;
 
-          let nextXp = room.xp + roomExpEarned;
-          let nextLevel = room.level;
-          let leveledUp = false;
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/gifts/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            giftId: gift.id,
+            recipientUid: resolvedRecipientUid,
+            roomId: targetRoomId,
+            customMessage: cleanMessage,
+            quantity: qty,
+          }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          charmEarned?: number;
+          randomCoinsEarned?: number;
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Gift send failed.');
+          return;
+        }
+        if (data.user) {
+          applyServerUserSnapshot(data.user);
+        }
+        void hydrateBackendState();
 
-          while (nextLevel < 20 && nextXp >= getRoomNextExp(nextLevel)) {
-            nextXp -= getRoomNextExp(nextLevel);
-            nextLevel += 1;
-            leveledUp = true;
-          }
+        const charmEarned = Number(data.charmEarned ?? gift.charmValue * qty);
+        const randomCoinsEarned = Number(data.randomCoinsEarned ?? 0);
+        const roomExpEarned = Math.max(1, Math.round(totalCost / 10));
+        const isBigGift = totalCost >= 500 || gift.rarity !== 'Standard' || Boolean(cleanMessage);
 
-          const newMessages = [
-            ...room.messages,
-            {
-              id: `gift-${Date.now()}`,
-              senderUid: userProfile.uid,
-              senderName: userProfile.name,
-              senderColor: '#FBBF24',
-              text: `sent ${qty > 1 ? `${qty}x ` : ''}${gift.name} to ${recipientName}${recipientUid ? ` (${recipientUid})` : ''}${cleanMessage ? ` · "${cleanMessage}"` : ''} (+${charmEarned.toLocaleString()} Charm, +${randomCoinsEarned.toLocaleString()} Random Coins, +${roomExpEarned.toLocaleString()} Room EXP)`,
-              timestamp,
-              kind: 'gift' as const,
-            },
-          ];
+        setUserGiftsGivenCoins((prev) => prev + totalCost);
+        soundFx.playGiftFanfare(gift.rarity);
+        setReceivedGiftIds((prev) => (prev.includes(gift.id) ? prev : [...prev, gift.id]));
 
-          if (leveledUp) {
-            newMessages.push({
-              id: `lvl-${Date.now()}`,
-              senderName: 'System',
-              senderColor: '#34D399',
-              text: `Room reached Level ${nextLevel}/20! ${getAdminSlotCount(nextLevel)} Admin Slots now unlocked.`,
-              timestamp,
-              kind: 'system',
-            });
-          }
+        const now = new Date();
+        const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-          let nextPkState = room.pkState;
-          if (nextPkState?.active && nextPkState.running && nextPkState.mode === 'gifting') {
-            const matchedSeat = room.seats.find(
-              (s) =>
-                (recipientUid && s.occupant?.uid === recipientUid) ||
-                s.occupant?.name === recipientName
-            );
-            const targetUidResolved = recipientUid || matchedSeat?.occupant?.uid || '';
-            let targetSide: 'pink' | 'blue' = 'pink';
-            if (targetUidResolved && nextPkState.blueTeamUids.includes(targetUidResolved)) {
-              targetSide = 'blue';
-            } else if (targetUidResolved && nextPkState.pinkTeamUids.includes(targetUidResolved)) {
-              targetSide = 'pink';
-            } else if (matchedSeat) {
-              const topCount = room.isOfficial ? 3 : 2;
-              const bottomSeats = room.seats.slice(topCount);
-              const bIdx = bottomSeats.findIndex((s) => s.seatIndex === matchedSeat.seatIndex);
-              if (nextPkState.format === '1v1') {
-                targetSide = bIdx === 7 ? 'blue' : 'pink';
-              } else {
-                const halfBottom = Math.ceil(bottomSeats.length / 2);
-                targetSide = bIdx >= halfBottom ? 'blue' : 'pink';
+        if (targetRoomId) {
+          setRooms((prev) =>
+            prev.map((room) => {
+              if (room.id !== targetRoomId) return room;
+              let nextXp = room.xp + roomExpEarned;
+              let nextLevel = room.level;
+              while (nextLevel < 20 && nextXp >= getRoomNextExp(nextLevel)) {
+                nextXp -= getRoomNextExp(nextLevel);
+                nextLevel += 1;
               }
-            }
-            nextPkState = {
-              ...nextPkState,
-              pinkScore:
-                targetSide === 'pink' ? nextPkState.pinkScore + totalCost : nextPkState.pinkScore,
-              blueScore:
-                targetSide === 'blue' ? nextPkState.blueScore + totalCost : nextPkState.blueScore,
-            };
-          }
+              return {
+                ...room,
+                level: nextLevel,
+                xp: nextXp,
+                coinsSpentByUid: {
+                  ...(room.coinsSpentByUid ?? {}),
+                  [userProfile.uid]: (room.coinsSpentByUid?.[userProfile.uid] ?? 0) + totalCost,
+                },
+                seats: room.seats.map((seat) => {
+                  const matchesUid = recipientUid && seat.occupant?.uid === recipientUid;
+                  const matchesName = seat.occupant?.name === recipientName;
+                  return matchesUid || matchesName
+                    ? {
+                        ...seat,
+                        giftScore: seat.giftScore + totalCost,
+                        charmValue: (seat.charmValue ?? 0) + charmEarned,
+                      }
+                    : seat;
+                }),
+                messages: [
+                  ...room.messages,
+                  {
+                    id: `gift-${Date.now()}`,
+                    senderUid: userProfile.uid,
+                    senderName: userProfile.name,
+                    senderColor: '#FBBF24',
+                    text: `sent ${qty > 1 ? `${qty}x ` : ''}${gift.name} to ${recipientName}${cleanMessage ? ` · "${cleanMessage}"` : ''} (+${charmEarned.toLocaleString()} Charm, +${randomCoinsEarned.toLocaleString()} Bonus Coins)`,
+                    timestamp,
+                    kind: 'gift' as const,
+                  },
+                ],
+              };
+            })
+          );
+        }
 
-          return {
-            ...room,
-            level: nextLevel,
-            xp: nextXp,
-            coinsSpentByUid: {
-              ...(room.coinsSpentByUid ?? {}),
-              [userProfile.uid]: (room.coinsSpentByUid?.[userProfile.uid] ?? 0) + totalCost,
-            },
-            pkState: nextPkState,
-            seats: room.seats.map((seat) => {
-              const matchesUid = recipientUid && seat.occupant?.uid === recipientUid;
-              const matchesName = seat.occupant?.name === recipientName;
-              return matchesUid || matchesName
-                ? {
-                    ...seat,
-                    giftScore: seat.giftScore + totalCost,
-                    charmValue: (seat.charmValue ?? 0) + charmEarned,
-                  }
-                : seat;
-            }),
-            messages: newMessages,
-          };
-        })
-      );
-    }
+        const giftPayload: ActiveGiftEvent = {
+          eventId: `ev-${Date.now()}`,
+          gift,
+          senderName: userProfile.name,
+          recipientName,
+          charmEarned,
+          randomCoinsEarned,
+          customMessage: cleanMessage,
+          isBigGift,
+        };
+        if (giftTimeoutRef.current) clearTimeout(giftTimeoutRef.current);
+        setActiveGiftEvent(giftPayload);
+        giftTimeoutRef.current = window.setTimeout(() => setActiveGiftEvent(null), 3200);
 
-    const giftPayload: ActiveGiftEvent = {
-      eventId: `ev-${Date.now()}`,
-      gift,
-      senderName: userProfile.name,
-      recipientName,
-      charmEarned,
-      randomCoinsEarned,
-      customMessage: cleanMessage,
-      isBigGift,
-    };
-
-    if (giftTimeoutRef.current) clearTimeout(giftTimeoutRef.current);
-    setActiveGiftEvent(giftPayload);
-    giftTimeoutRef.current = window.setTimeout(() => {
-      setActiveGiftEvent(null);
-    }, 3200);
-
-    if (isBigGift) {
-      if (bigGiftTimeoutRef.current) clearTimeout(bigGiftTimeoutRef.current);
-      setBigGiftBanner(giftPayload);
-      bigGiftTimeoutRef.current = window.setTimeout(() => {
-        setBigGiftBanner(null);
-      }, 5500);
-    }
+        if (isBigGift) {
+          if (bigGiftTimeoutRef.current) clearTimeout(bigGiftTimeoutRef.current);
+          setBigGiftBanner(giftPayload);
+          bigGiftTimeoutRef.current = window.setTimeout(() => setBigGiftBanner(null), 5500);
+        }
+        void hydrateBackendState();
+      } catch {
+        showToast('Network error while sending gift.');
+      }
+    })();
   };
 
   // PK Battle Handlers (Owner/Admin-only setup & start/end, 1 vote per user in Voting PK)
@@ -1497,278 +3665,589 @@ export default function App() {
     soundFx.playVictory();
   };
 
-  // Creating a room costs 500 Coins & grants 1 Permanent Room per user
-  const handleCreateRoom = (data: {
+  // Create persistent voice room in PostgreSQL (strict 1 personal room per account)
+  const handleCreateRoom = async (data: {
     title: string;
     topic: string;
     category: VoiceRoom['category'];
     ambiance: VoiceRoom['ambiance'];
     roomType: VoiceRoom['roomType'];
-  }) => {
-    if (hasCreatedRoom || coins < 500) return;
-
-    setCoins((prev) => prev - 500);
-    applyCoinSpend(500);
-    setHasCreatedRoom(true);
-
-    const generatedUid = String(Math.floor(10000 + Math.random() * 89999));
-    const newRoom: VoiceRoom = {
-      id: `room-${Date.now()}`,
-      uid: generatedUid,
-      title: data.title,
-      topic: data.topic,
-      category: data.category,
-      tags: [data.category, 'Voice'],
-      hostName: userProfile.name,
-      ownerUid: userProfile.uid,
-      adminUids: [],
-      memberUids: [userProfile.uid],
-      isOfficial: false,
-      isUserCreated: true,
-      roomType: 'voice',
-      level: 1,
-      xp: 0,
-      listenerCount: 1,
-      ambiance: data.ambiance,
-      bgThemeId:
-        ROOM_BACKGROUND_THEMES.find((t) => t.ambiance === data.ambiance)?.id ?? 'bg-saffron',
-      seats: [
-        {
-          seatIndex: 0,
-          occupant: userProfile,
-          role: 'owner',
-          isMuted: false,
-          isLocked: false,
-          isSpeaking: true,
-          audioLevel: 0.5,
-          isUser: true,
-          giftScore: 0,
-          charmValue: charm,
-          vipLevel: effectiveVipLevel,
-        },
-        ...Array.from({ length: 9 }, (_, i) => ({
-          seatIndex: i + 1,
-          occupant: null,
-          role: 'empty' as const,
-          isMuted: false,
-          isLocked: false,
-          isSpeaking: false,
-          audioLevel: 0,
-          giftScore: 0,
-        })),
-      ],
-      coinsSpentByUid: {},
-      listeners: [],
-      micRequests: [],
-      messages: [
-        {
-          id: `sys-${Date.now()}`,
-          senderName: 'System',
-          senderColor: '#F59E0B',
-          text: `${data.title} (UID ${generatedUid}) created for 500 Coins! Level 1 with 3 Admin Slots.`,
-          timestamp: 'Now',
-          kind: 'system',
-        },
-      ],
-    };
-
-    setRooms((prev) => [newRoom, ...prev]);
-    setActiveRoomId(newRoom.id);
-    setUserSeatIndex(0);
-    setActiveSection('rooms');
-    soundFx.playVictory();
+    seatCapacity: 10 | 15 | 19;
+    roomCode?: string;
+    dpUrl?: string;
+    isRoomLocked?: boolean;
+    roomPasscode?: string;
+  }): Promise<boolean> => {
+    if (hasCreatedRoom) {
+      showToast('Each user can create at most 1 personal Voice Room.');
+      return false;
+    }
+    try {
+      const resp = await apiFetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: data.title,
+          topic: data.topic,
+          category: data.category,
+          ambiance: data.ambiance,
+          seatCapacity: data.seatCapacity,
+          roomCode: data.roomCode,
+          dpUrl: data.dpUrl,
+          isRoomLocked: data.isRoomLocked,
+          roomPasscode: data.roomPasscode,
+        }),
+      });
+      const resData = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        room?: { id: string };
+      };
+      if (!resp.ok || !resData.ok || !resData.room) {
+        showToast(resData.error || 'Could not create voice room.');
+        return false;
+      }
+      await hydrateBackendState();
+      setHasCreatedRoom(true);
+      enterRoomDirect(resData.room.id);
+      setActiveSection('rooms');
+      soundFx.playVictory();
+      return true;
+    } catch {
+      showToast('Network error creating voice room.');
+      return false;
+    }
   };
 
-  // Home Hub handlers
+  // Home Hub handlers (Daily Tasks backed by PostgreSQL; NEVER grants VIP)
   const handleClaimTask = (taskId: string) => {
-    const task = dailyTasks.find((t) => t.id === taskId);
-    if (!task || task.claimed || task.progress < task.target) return;
-    setDailyTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, claimed: true } : t)));
-    setCoins((prev) => prev + task.rewardCoins);
+    void (async () => {
+      try {
+        const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/claim`, {
+          method: 'POST',
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          coinsAwarded?: number;
+          claimedTaskChests?: number[];
+          error?: string;
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Task not ready to claim.');
+          return;
+        }
+        if (data.user) applyServerUserSnapshot(data.user);
+        if (Array.isArray(data.claimedTaskChests)) {
+          setClaimedTaskChests(data.claimedTaskChests.map(Number));
+        }
+        setDailyTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, claimed: true } : t)));
+        soundFx.playVictory();
+        showToast(`Claimed +${Number(data.coinsAwarded ?? 0).toLocaleString()} Coins!`);
+        void hydrateBackendState();
+      } catch {
+        showToast('Unable to claim task right now.');
+      }
+    })();
+  };
+
+  const handleClaimTaskChest = (step: number, _rewardCoins: number) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch(`/api/tasks/chests/${encodeURIComponent(String(step))}/claim`, {
+          method: 'POST',
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          label?: string;
+          coinsAwarded?: number;
+          claimedTaskChests?: number[];
+          error?: string;
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Complete more daily tasks to unlock this chest.');
+          return;
+        }
+        if (data.user) applyServerUserSnapshot(data.user);
+        if (Array.isArray(data.claimedTaskChests)) {
+          setClaimedTaskChests(data.claimedTaskChests.map(Number));
+        }
+        soundFx.playVictory();
+        showToast(
+          `Unlocked ${data.label || 'Milestone Chest'}: +${Number(data.coinsAwarded ?? 0).toLocaleString()} Coins!`
+        );
+        void hydrateBackendState();
+      } catch {
+        showToast('Unable to claim chest reward right now.');
+      }
+    })();
+  };
+
+  const handleInviteFriendApp = () => {
     soundFx.playVictory();
+    showToast('Share your OG VELOCITY ID to invite friends!');
   };
 
   const handleAddFriendByUid = (rawUid: string): string => {
-    const cleanUid = rawUid.trim().toUpperCase();
+    const cleanUid = rawUid.trim();
     if (!cleanUid) return 'Enter a valid User ID.';
-    if (cleanUid === userProfile.uid) return 'That is your own permanent OG VELOCITY UID.';
-    if (friends.some((f) => f.uid.toUpperCase() === cleanUid)) {
-      return `${cleanUid} is already in your Friends list.`;
+    if (cleanUid === userProfile.uid || (userProfile.publicId && cleanUid === userProfile.publicId)) {
+      return 'That is your own permanent OG VELOCITY ID.';
     }
-    const matched = AVATAR_ROSTER.find((a) => a.uid.toUpperCase() === cleanUid);
-    const newFriend: FriendRecord = matched
-      ? {
-          uid: matched.uid,
-          name: matched.name,
-          avatarId: matched.id,
-          status: 'Online',
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/friends/request', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetUidOrPublicId: cleanUid }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Could not send friend request.');
+          return;
         }
-      : {
-          uid: cleanUid,
-          name: `Player ${cleanUid.slice(-4)}`,
-          avatarId: AVATAR_ROSTER[4].id,
-          status: 'Online',
-        };
-    setFriends((prev) => [newFriend, ...prev]);
-    soundFx.playVictory();
-    return `Added ${newFriend.name} (${newFriend.uid}) to your Friends!`;
+        setOutgoingPendingFriendUids((prev) =>
+          prev.includes(cleanUid) ? prev : [...prev, cleanUid]
+        );
+        showToast(`Friend request sent to ${cleanUid}!`);
+        void hydrateBackendState();
+        if (inspectedUser && (inspectedUser.avatar.uid === cleanUid || inspectedUser.avatar.publicId === cleanUid)) {
+          inspectUserById(cleanUid);
+        }
+      } catch {
+        showToast('Failed to send friend request.');
+      }
+    })();
+    return `Sending friend request to ${cleanUid}...`;
   };
 
-  // Chat handlers
+  const handleCancelFriendRequest = async (targetUid: string): Promise<string> => {
+    try {
+      const resp = await apiFetch('/api/friends/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetUidOrPublicId: targetUid }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!resp.ok || !data.ok) {
+        showToast(data.error || 'Unable to cancel friend request.');
+        return data.error || 'Unable to cancel friend request.';
+      }
+      setOutgoingPendingFriendUids((prev) => prev.filter((id) => id !== targetUid));
+      showToast('Friend request cancelled.');
+      void hydrateBackendState();
+      if (inspectedUser && (inspectedUser.avatar.uid === targetUid || inspectedUser.avatar.publicId === targetUid)) {
+        inspectUserById(targetUid);
+      }
+      return 'Friend request cancelled.';
+    } catch {
+      showToast('Failed to cancel friend request.');
+      return 'Failed to cancel friend request.';
+    }
+  };
+
+  const handleRespondFriendRequest = (relationId: number, accept: boolean) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/friends/respond', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ relationId, accept }),
+        });
+        if (resp.ok) {
+          soundFx.playVictory();
+          showToast(accept ? 'Friend request accepted!' : 'Friend request declined.');
+          void hydrateBackendState();
+          if (inspectedUser) {
+            inspectUserById(inspectedUser.avatar.publicId || inspectedUser.avatar.uid);
+          }
+        }
+      } catch {
+        showToast('Failed to respond to friend request.');
+      }
+    })();
+  };
+
+  const handleRespondByPeerUid = (peerUid: string, accept: boolean) => {
+    const rel =
+      inspectedUser?.relationId &&
+      (inspectedUser.avatar.uid === peerUid || inspectedUser.avatar.publicId === peerUid)
+        ? { id: inspectedUser.relationId }
+        : pendingFriendRequests.find((r) => r.requesterUid === peerUid || r.publicId === peerUid);
+    if (!rel?.id) {
+      showToast('Pending friend request not found.');
+      return;
+    }
+    handleRespondFriendRequest(rel.id, accept);
+  };
+
+  const handleUnfriendUser = (targetUid: string, targetName: string) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch(`/api/friends/${encodeURIComponent(targetUid)}`, {
+          method: 'DELETE',
+        });
+        if (resp.ok) {
+          showToast(`Removed ${targetName} from friends.`);
+          setChatThreads((prev) => prev.filter((t) => t.friendUid !== targetUid));
+          void hydrateBackendState();
+          if (inspectedUser && (inspectedUser.avatar.uid === targetUid || inspectedUser.avatar.publicId === targetUid)) {
+            inspectUserById(targetUid);
+          }
+        }
+      } catch {
+        showToast('Failed to unfriend user.');
+      }
+    })();
+  };
+
+  const handleBlockUser = (targetUid: string, targetName: string) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/friends/block', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetUid }),
+        });
+        if (resp.ok) {
+          showToast(`Blocked ${targetName}.`);
+          setChatThreads((prev) => prev.filter((t) => t.friendUid !== targetUid));
+          void hydrateBackendState();
+          if (inspectedUser && (inspectedUser.avatar.uid === targetUid || inspectedUser.avatar.publicId === targetUid)) {
+            inspectUserById(targetUid);
+          }
+        }
+      } catch {
+        showToast('Failed to block user.');
+      }
+    })();
+  };
+
+  const handleUnblockUser = (targetUid: string, targetName: string) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/friends/unblock', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetUid }),
+        });
+        if (resp.ok) {
+          showToast(`Unblocked ${targetName}.`);
+          void hydrateBackendState();
+          if (inspectedUser && (inspectedUser.avatar.uid === targetUid || inspectedUser.avatar.publicId === targetUid)) {
+            inspectUserById(targetUid);
+          }
+        }
+      } catch {
+        showToast('Failed to unblock user.');
+      }
+    })();
+  };
+
+  const handleReportContent = (
+    targetType: 'user' | 'post' | 'room',
+    targetId: string,
+    reason: string
+  ) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/reports', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetType, targetId, reason }),
+        });
+        if (resp.ok) {
+          showToast('Report submitted to OG VELOCITY moderation.');
+        }
+      } catch {
+        showToast('Failed to submit report.');
+      }
+    })();
+  };
+
+  const handleJoinEvent = async (eventId: string) => {
+    const resp = await apiFetch(`/api/events/${encodeURIComponent(eventId)}/join`, {
+      method: 'POST',
+    });
+    if (resp.ok) {
+      soundFx.playVictory();
+      showToast('Joined event! Check notifications for live updates.');
+    }
+  };
+
+  const handleMarkNotificationsRead = () => {
+    void apiFetch('/api/notifications/read-all', { method: 'POST' })
+      .then((r) => {
+        if (r.ok) {
+          setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+        }
+      })
+      .catch(() => {});
+  };
+
+  // Chat handlers (backed by PostgreSQL DM persistence & WebSocket dm:send; accepted friends only)
   const handleSelectChatThread = (friendUid: string) => {
     setChatThreads((prev) =>
       prev.map((t) => (t.friendUid === friendUid ? { ...t, unread: 0 } : t))
     );
+    void apiFetch(`/api/messages/dm/${encodeURIComponent(friendUid)}/read`, {
+      method: 'POST',
+    }).catch(() => {});
+    void apiFetch(`/api/messages/dm/${encodeURIComponent(friendUid)}?limit=40`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then(
+        (
+          d: {
+            hasMore?: boolean;
+            messages?: Array<{
+              id: number | string;
+              senderUid: string;
+              body: string;
+              imageUrl?: string | null;
+              createdAt?: string;
+            }>;
+          } | null
+        ) => {
+          if (!d?.messages) return;
+          const oldest = d.messages[0]?.createdAt;
+          if (oldest) oldestMsgCreatedAtRef.current[friendUid] = oldest;
+          setHasMoreMessagesByUid((prev) => ({ ...prev, [friendUid]: Boolean(d.hasMore) }));
+          setChatThreads((prev) =>
+            prev.map((t) =>
+              t.friendUid === friendUid
+                ? {
+                    ...t,
+                    unread: 0,
+                    messages: d.messages!.map((m) => ({
+                      id: String(m.id),
+                      senderId: m.senderUid,
+                      senderName: m.senderUid === userProfile.uid ? userProfile.name : t.friendName,
+                      text: m.body,
+                      imageUrl: m.imageUrl || undefined,
+                      timestamp: m.createdAt
+                        ? new Date(m.createdAt).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        : 'Now',
+                      isSelf: m.senderUid === userProfile.uid,
+                    })),
+                  }
+                : t
+            )
+          );
+        }
+      )
+      .catch(() => {});
+  };
+
+  const handleLoadOlderMessages = (friendUid: string) => {
+    const beforeCursor = oldestMsgCreatedAtRef.current[friendUid];
+    if (!beforeCursor) return;
+    void apiFetch(
+      `/api/messages/dm/${encodeURIComponent(friendUid)}?limit=40&before=${encodeURIComponent(beforeCursor)}`
+    )
+      .then((r) => (r.ok ? r.json() : null))
+      .then(
+        (
+          d: {
+            hasMore?: boolean;
+            messages?: Array<{
+              id: number | string;
+              senderUid: string;
+              body: string;
+              imageUrl?: string | null;
+              createdAt?: string;
+            }>;
+          } | null
+        ) => {
+          if (!d?.messages) return;
+          const oldest = d.messages[0]?.createdAt;
+          if (oldest) oldestMsgCreatedAtRef.current[friendUid] = oldest;
+          setHasMoreMessagesByUid((prev) => ({ ...prev, [friendUid]: Boolean(d.hasMore) }));
+          setChatThreads((prev) =>
+            prev.map((t) => {
+              if (t.friendUid !== friendUid) return t;
+              const existingIds = new Set(t.messages.map((m) => m.id));
+              const olderMapped = d.messages!
+                .filter((m) => !existingIds.has(String(m.id)))
+                .map((m) => ({
+                  id: String(m.id),
+                  senderId: m.senderUid,
+                  senderName: m.senderUid === userProfile.uid ? userProfile.name : t.friendName,
+                  text: m.body,
+                  imageUrl: m.imageUrl || undefined,
+                  timestamp: m.createdAt
+                    ? new Date(m.createdAt).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })
+                    : 'Now',
+                  isSelf: m.senderUid === userProfile.uid,
+                }));
+              return { ...t, messages: [...olderMapped, ...t.messages] };
+            })
+          );
+        }
+      )
+      .catch(() => {});
   };
 
   const handleSendChatMessage = (friendUid: string, text: string, imageUrl?: string) => {
-    const now = new Date();
-    const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    setChatThreads((prev) =>
-      prev.map((thread) =>
-        thread.friendUid === friendUid
-          ? {
-              ...thread,
-              unread: 0,
-              messages: [
-                ...thread.messages,
-                {
-                  id: `cm-${Date.now()}`,
-                  senderId: userProfile.id,
-                  senderName: userProfile.name,
-                  text,
-                  imageUrl,
-                  timestamp,
-                  isSelf: true,
-                  bubbleColor: equippedBubbleColor,
-                },
-              ],
-            }
-          : thread
-      )
-    );
-    advanceDailyTask('dt-3');
+    const clean = text.trim();
+    if (!clean && !imageUrl) return;
+    ogRealtime.send({
+      type: 'dm:send',
+      recipientUid: friendUid,
+      body: clean || (imageUrl ? '📷 Photo' : ''),
+      imageUrl,
+    });
     soundFx.playMove();
   };
 
   const handleJoinFriendVoiceRoom = (roomUid: string) => {
-    const target = rooms.find((r) => r.uid === roomUid);
-    if (target) {
-      if (handleSelectRoom(target.id)) {
-        setActiveSection('rooms');
-      }
-      return;
-    }
-    setActiveSection('rooms');
+    void openRoomByIdOrLink(roomUid);
   };
 
   const handleMessageUser = (uid: string, name: string) => {
+    const isFriend = friends.some((f) => f.uid === uid || f.publicId === uid);
+    if (!isFriend) {
+      showToast('Send and accept a friend request first to chat in Direct Messages.');
+      return;
+    }
     const existing = chatThreads.find((t) => t.friendUid === uid);
     if (!existing) {
-      const matched = AVATAR_ROSTER.find((a) => a.uid === uid);
       setChatThreads((prev) => [
         {
           friendUid: uid,
           friendName: name,
-          avatarId: matched?.id ?? AVATAR_ROSTER[0].id,
+          avatarId: uid,
           status: 'Online',
+          online: true,
           unread: 0,
-          messages: [
-            {
-              id: `cm-init-${Date.now()}`,
-              senderId: uid,
-              senderName: name,
-              text: `Hey ${userProfile.name}! Say hi in OG VELOCITY Chats.`,
-              timestamp: 'Now',
-              isSelf: false,
-            },
-          ],
+          messages: [],
         },
         ...prev,
       ]);
-    } else {
-      handleSelectChatThread(uid);
     }
+    handleSelectChatThread(uid);
     setActiveSection('chat');
   };
 
   const handleSendBackMessage = (uid: string, name: string, text: string) => {
     const clean = text.trim();
     if (!clean) return;
-    const now = new Date();
-    const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const matched = AVATAR_ROSTER.find((a) => a.uid === uid);
-
-    setChatThreads((prev) => {
-      const existing = prev.find((t) => t.friendUid === uid);
-      const newMsg = {
-        id: `cm-back-${Date.now()}`,
-        senderId: userProfile.id,
-        senderName: userProfile.name,
-        text: clean,
-        timestamp,
-        isSelf: true,
-        bubbleColor: equippedBubbleColor,
-      };
-      if (existing) {
-        return prev.map((t) =>
-          t.friendUid === uid
-            ? { ...t, unread: 0, messages: [...t.messages, newMsg] }
-            : t
-        );
-      }
-      return [
+    const isFriend = friends.some((f) => f.uid === uid || f.publicId === uid);
+    if (!isFriend) {
+      showToast('Direct messages are available only between accepted friends.');
+      return;
+    }
+    const existing = chatThreads.find((t) => t.friendUid === uid);
+    if (!existing) {
+      setChatThreads((prev) => [
         {
           friendUid: uid,
           friendName: name,
-          avatarId: matched?.id ?? AVATAR_ROSTER[0].id,
+          avatarId: uid,
           status: 'Online',
+          online: true,
           unread: 0,
-          messages: [newMsg],
+          messages: [],
         },
         ...prev,
-      ];
-    });
-    advanceDailyTask('dt-3');
+      ]);
+    }
+    ogRealtime.send({ type: 'dm:send', recipientUid: uid, body: clean });
     soundFx.playMove();
   };
 
-  // Discover Moments handlers
+  // Discover Moments handlers (PostgreSQL backed)
   const handleToggleLikeMoment = (momentId: string) => {
-    setMoments((prev) =>
-      prev.map((m) =>
-        m.id === momentId
-          ? {
-              ...m,
-              liked: !m.liked,
-              likes: m.liked ? Math.max(0, m.likes - 1) : m.likes + 1,
-            }
-          : m
-      )
-    );
-    soundFx.playMove();
+    void (async () => {
+      try {
+        const resp = await apiFetch(`/api/moments/${encodeURIComponent(momentId)}/like`, {
+          method: 'POST',
+        });
+        const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; liked?: boolean };
+        if (resp.ok && data.ok) {
+          setMoments((prev) =>
+            prev.map((m) =>
+              m.id === momentId
+                ? {
+                    ...m,
+                    liked: Boolean(data.liked),
+                    likes: data.liked ? m.likes + 1 : Math.max(0, m.likes - 1),
+                  }
+                : m
+            )
+          );
+          soundFx.playMove();
+        }
+      } catch {
+        // Ignore transient like error
+      }
+    })();
   };
 
-  const handleAddMoment = (caption: string, mediaType: 'photo' | 'video', mediaUrl?: string) => {
-    const post: MomentPost = {
-      id: `mom-${Date.now()}`,
-      authorUid: userProfile.uid,
-      authorName: userProfile.name,
-      avatarId: userProfile.id,
-      mediaType,
-      mediaUrl,
-      mediaTitle: mediaType === 'video' ? `${userProfile.name}'s Live Clip` : `${userProfile.name}'s Snapshot`,
-      caption,
-      mediaGradient:
-        mediaType === 'video'
-          ? 'linear-gradient(135deg, #4c0519 0%, #7c2d12 45%, #0f172a 100%)'
-          : 'linear-gradient(135deg, #064e3b 0%, #1e3a8a 50%, #090b12 100%)',
-      timestamp: 'Just now',
-      likes: 1,
-      liked: true,
-    };
-    setMoments((prev) => [post, ...prev]);
-    soundFx.playVictory();
+  const handleAddMoment = (
+    caption: string,
+    mediaType: 'photo' | 'video',
+    mediaUrl?: string,
+    visibility: 'public' | 'selected' = 'public',
+    allowedUids: string[] = []
+  ) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/moments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ caption, mediaType, mediaUrl, visibility, allowedUids }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Could not publish moment.');
+          return;
+        }
+        soundFx.playVictory();
+        void hydrateBackendState();
+      } catch {
+        showToast('Network error publishing moment.');
+      }
+    })();
+  };
+
+  const handlePurchaseActionTag = async (
+    partnerUid: string,
+    tagType: 'bro' | 'bestie' | 'sister' | 'soulmate' | 'confident'
+  ): Promise<{ ok: boolean; message: string }> => {
+    try {
+      const resp = await apiFetch('/api/action-room/tags/purchase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          partnerUid,
+          tagType,
+          idempotencyKey: `act-tag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        coinsAfter?: number;
+        user?: Parameters<typeof applyServerUserSnapshot>[0];
+      };
+      if (!resp.ok || !data.ok) {
+        return { ok: false, message: data.error || 'Unable to activate Action Room tag.' };
+      }
+      if (data.user) applyServerUserSnapshot(data.user);
+      else if (typeof data.coinsAfter === 'number') setCoins(data.coinsAfter);
+      soundFx.playVictory();
+      void hydrateBackendState();
+      return { ok: true, message: `Tag ${tagType.toUpperCase()} invitation sent & Coins deducted!` };
+    } catch {
+      return { ok: false, message: 'Network error activating Action Room tag.' };
+    }
   };
 
   const handleInviteFriendToRoom = (roomId: string, friend: FriendRecord) => {
@@ -1811,117 +4290,135 @@ export default function App() {
     soundFx.playVictory();
   };
 
-  // CP (Couple / Partner) Ring Proposal Workflow (Purchased Rings Only)
+  // CP (Couple / Partner) Synchronized Backend Workflow (Decoupled from Shop Rings)
   const handleProposeCp = (
     toUid: string,
-    toName: string,
-    toAvatarId: string,
+    _toName: string,
+    _toAvatarId: string,
     ringNumber: number,
     ringName: string
   ) => {
-    if (!toUid || toUid === userProfile.uid) return;
-    const ownsRing = ownedItemIds.some(
-      (id) =>
-        id === `ring-${ringNumber}` ||
-        SHOP_ITEMS.find((item) => item.id === id && item.category === 'ring')?.ringNumber ===
-          ringNumber
-    );
-    if (!ownsRing) return;
-    const now = new Date();
-    const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const newReq: CpRequest = {
-      id: `cp-req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      fromUid: userProfile.uid,
-      fromName: userProfile.name,
-      fromAvatarId: userProfile.id,
-      toUid,
-      toName,
-      toAvatarId,
-      ringNumber,
-      ringName,
-      status: 'pending',
-      timestamp,
-    };
-    setCpRequests((prev) => [newReq, ...prev]);
-
-    handleSendBackMessage(
-      toUid,
-      toName,
-      `💍 Sent a CP Proposal with ${ringName} (Ring #${ringNumber})! Open Me → Intimate & CP to accept.`
-    );
-
-    if (activeRoomId) {
-      setRooms((prev) =>
-        prev.map((r) =>
-          r.id === activeRoomId
-            ? {
-                ...r,
-                messages: [
-                  ...r.messages,
-                  {
-                    id: `sys-cp-${Date.now()}`,
-                    senderName: 'CP Cupido',
-                    senderColor: '#F472B6',
-                    text: `${userProfile.name} sent a CP Ring proposal (${ringName}) to ${toName} (${toUid})!`,
-                    timestamp,
-                    kind: 'system',
-                  },
-                ],
-              }
-            : r
-        )
-      );
+    const cleanTarget = toUid.trim();
+    if (!cleanTarget || cleanTarget === userProfile.uid || cleanTarget === userProfile.publicId) {
+      showToast('Please select another user to propose CP.');
+      return;
     }
-    soundFx.playGiftFanfare('Signature');
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/cp/propose', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toUid: cleanTarget, ringNumber, ringName }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          cpState?: {
+            cpPartner?: AvatarConfig['cpPartner'];
+            proposals?: CpRequest[];
+            history?: CpRelationshipHistoryRecord[];
+          };
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Could not send CP proposal.');
+          return;
+        }
+        if (data.cpState) {
+          setUserProfile((prev) => ({ ...prev, cpPartner: data.cpState!.cpPartner ?? null }));
+          if (Array.isArray(data.cpState.proposals)) setCpRequests(data.cpState.proposals);
+          if (Array.isArray(data.cpState.history)) setCpRelationshipHistory(data.cpState.history);
+        }
+        soundFx.playGiftFanfare('Signature');
+        showToast(`CP Bond proposal (${ringName}) sent!`);
+      } catch {
+        showToast('Network error while sending CP proposal.');
+      }
+    })();
   };
 
   const handleRespondCpRequest = (requestId: string, accept: boolean) => {
-    const req = cpRequests.find((r) => r.id === requestId);
-    if (!req || req.status !== 'pending') return;
-
-    setCpRequests((prev) =>
-      prev.map((r) =>
-        r.id === requestId ? { ...r, status: accept ? 'accepted' : 'declined' } : r
-      )
-    );
-
-    if (accept) {
-      const isIncoming = req.toUid === userProfile.uid;
-      const partnerUid = isIncoming ? req.fromUid : req.toUid;
-      const partnerName = isIncoming ? req.fromName : req.toName;
-      const partnerAvatarId = isIncoming ? req.fromAvatarId : req.toAvatarId;
-      const since = getTodayDateKey();
-
-      setUserProfile((prev) => ({
-        ...prev,
-        cpPartner: {
-          partnerUid,
-          partnerName,
-          partnerAvatarId,
-          ringNumber: req.ringNumber,
-          ringName: req.ringName,
-          since,
-          cpCharm: 0,
-          cpLevel: 1,
-        },
-      }));
-      setIntimateSpace((prev) => ({
-        ...prev,
-        partnerName,
-        partnerAvatarId,
-      }));
-      soundFx.playVictory();
-    } else {
-      soundFx.playMove();
-    }
+    void (async () => {
+      try {
+        const resp = await apiFetch(`/api/cp/proposals/${encodeURIComponent(requestId)}/respond`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accept }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          cpState?: {
+            cpPartner?: AvatarConfig['cpPartner'];
+            proposals?: CpRequest[];
+            history?: CpRelationshipHistoryRecord[];
+          };
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Failed to respond to CP proposal.');
+          return;
+        }
+        if (data.cpState) {
+          setUserProfile((prev) => ({ ...prev, cpPartner: data.cpState!.cpPartner ?? null }));
+          if (Array.isArray(data.cpState.proposals)) setCpRequests(data.cpState.proposals);
+          if (Array.isArray(data.cpState.history)) setCpRelationshipHistory(data.cpState.history);
+          if (data.cpState.cpPartner) {
+            setIntimateSpace((prev) => ({
+              ...prev,
+              partnerName: data.cpState!.cpPartner!.partnerName,
+              partnerAvatarId: data.cpState!.cpPartner!.partnerAvatarId,
+              progress: data.cpState!.cpPartner!.cpCharm ?? 0,
+            }));
+          }
+        }
+        if (data.user) {
+          applyServerUserSnapshot(data.user);
+        }
+        if (accept) {
+          soundFx.playVictory();
+          showToast('CP Bond accepted! Both profiles are now linked.');
+        } else {
+          soundFx.playMove();
+          showToast('CP proposal declined.');
+        }
+      } catch {
+        showToast('Network error responding to CP proposal.');
+      }
+    })();
   };
 
   const handleBreakCp = () => {
-    setUserProfile((prev) => ({
-      ...prev,
-      cpPartner: null,
-    }));
-    soundFx.playMove();
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/cp/break', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          cpState?: {
+            cpPartner?: AvatarConfig['cpPartner'];
+            proposals?: CpRequest[];
+            history?: CpRelationshipHistoryRecord[];
+          };
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Could not unbind CP.');
+          return;
+        }
+        setUserProfile((prev) => ({ ...prev, cpPartner: null }));
+        setIntimateSpace(INITIAL_INTIMATE_SPACE);
+        if (data.cpState) {
+          if (Array.isArray(data.cpState.proposals)) setCpRequests(data.cpState.proposals);
+          if (Array.isArray(data.cpState.history)) setCpRelationshipHistory(data.cpState.history);
+        }
+        soundFx.playMove();
+        showToast('CP relationship unbound.');
+      } catch {
+        showToast('Network error ending CP relationship.');
+      }
+    })();
   };
 
   // Ring Support Animation & Blessing Boost Handler
@@ -1999,41 +4496,61 @@ export default function App() {
     soundFx.playGiftFanfare('Signature');
   };
 
-  // Create Gift Submission & Approval/Rejection Workflow
+  // Create Gift Submission (Admin-reviewed on server)
   const handleSubmitCustomGift = (
     submission: Omit<CustomGiftSubmission, 'id' | 'creatorUid' | 'creatorName' | 'status' | 'submittedAt'>
   ) => {
-    const now = new Date();
-    const submittedAt = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const newEntry: CustomGiftSubmission = {
-      ...submission,
-      id: `custom-gift-${Date.now()}`,
-      creatorUid: userProfile.uid,
-      creatorName: userProfile.name,
-      status: 'pending',
-      submittedAt,
-    };
-    setCustomGifts((prev) => [newEntry, ...prev]);
-    soundFx.playVictory();
+    void (async () => {
+      try {
+        const rarity =
+          submission.cost >= 1500 ? 'Mythic' : submission.cost >= 300 ? 'Signature' : 'Standard';
+        const resp = await apiFetch('/api/gifts/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: submission.name,
+            cost: submission.cost,
+            charmValue: submission.charmValue,
+            rarity,
+            description: submission.description,
+            primaryColor: submission.primaryColor,
+            secondaryColor: submission.secondaryColor,
+            particleStyle: submission.particleStyle,
+            artworkUrl: submission.artworkUrl ?? null,
+            animationVideoUrl: submission.animationVideoUrl ?? null,
+            videoFileName: submission.videoFileName ?? null,
+          }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          submission?: CustomGiftSubmission & { createdAt?: string };
+        };
+        if (!resp.ok || !data.ok || !data.submission) {
+          showToast(data.error || 'Could not submit custom gift.');
+          return;
+        }
+        const entry: CustomGiftSubmission = {
+          ...data.submission,
+          creatorUid: userProfile.publicId || userProfile.uid,
+          creatorName: userProfile.name,
+          submittedAt: data.submission.submittedAt || data.submission.createdAt || new Date().toISOString(),
+        };
+        setCustomGifts((prev) => [entry, ...prev]);
+        soundFx.playVictory();
+        showToast('Custom gift submitted for Admin approval!');
+        void hydrateBackendState();
+      } catch {
+        showToast('Network error submitting custom gift.');
+      }
+    })();
   };
 
-  const handleReviewCustomGift = (
-    giftId: string,
-    status: 'approved' | 'rejected',
-    reviewNote?: string
-  ) => {
-    setCustomGifts((prev) =>
-      prev.map((g) => (g.id === giftId ? { ...g, status, reviewNote } : g))
-    );
-    if (status === 'approved') {
-      soundFx.playGiftFanfare('Signature');
-    } else {
-      soundFx.playMove();
-    }
-  };
-
-  // Profile & Shop handlers (UID stays immutable)
+  // Profile & Shop handlers (UID and verified identity stay locked; wallet/VIP strictly server-backed)
   const handleUpdateProfile = (updates: Partial<AvatarConfig>) => {
+    if (updates.themeMode === 'light' || updates.themeMode === 'dark') {
+      setThemeMode(updates.themeMode);
+    }
     setUserProfile((prev) => ({
       ...prev,
       name: updates.name ?? prev.name,
@@ -2043,62 +4560,409 @@ export default function App() {
       age: updates.age ?? prev.age,
       country: updates.country ?? prev.country,
       tags: updates.tags ?? prev.tags,
-      email: updates.email ?? prev.email,
       ornament: updates.ornament ?? prev.ornament,
+      themeMode: updates.themeMode ?? prev.themeMode,
+      equippedEmoteId:
+        updates.equippedEmoteId !== undefined ? updates.equippedEmoteId : prev.equippedEmoteId,
       photoUrl: updates.photoUrl !== undefined ? updates.photoUrl : prev.photoUrl,
       coverUrl: updates.coverUrl !== undefined ? updates.coverUrl : prev.coverUrl,
       uid: prev.uid,
     }));
+    void apiFetch('/api/protected/profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: updates.name,
+        bio: updates.bio,
+        gender: updates.gender,
+        age: updates.age,
+        country: updates.country,
+        ornament: updates.ornament,
+        handle: updates.handle,
+        photoUrl: updates.photoUrl,
+        themeMode: updates.themeMode,
+        equippedEmoteId: updates.equippedEmoteId,
+      }),
+    }).catch(() => {});
   };
 
-  const handleBuyCoins = (amount: number, _priceInr: number) => {
-    setCoins((prev) => prev + amount);
-    soundFx.playVictory();
+  const handleRequestWithdrawal = async (payload: {
+    amountCoins: number;
+    payoutMethod: 'upi' | 'bank';
+    accountHolderName: string;
+    upiOrAccount: string;
+    ifscOrBank?: string;
+  }): Promise<{ ok: boolean; message: string }> => {
+    try {
+      const resp = await apiFetch('/api/withdrawals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        withdrawals?: WithdrawalRequestRecord[];
+        user?: Parameters<typeof applyServerUserSnapshot>[0];
+      };
+      if (!resp.ok || !data.ok) {
+        return { ok: false, message: data.error || 'Could not submit withdrawal request.' };
+      }
+      if (data.user) applyServerUserSnapshot(data.user);
+      if (Array.isArray(data.withdrawals)) setWithdrawals(data.withdrawals);
+      soundFx.playVictory();
+      void hydrateBackendState();
+      return { ok: true, message: 'Withdrawal request submitted for Super Admin review.' };
+    } catch {
+      return { ok: false, message: 'Network error submitting withdrawal request.' };
+    }
   };
 
-  const handleBuyVip = (
-    planName: string,
-    _priceInr: number,
-    grantedVipLevel: number,
-    bonusGrowth: number
-  ) => {
-    setVipLabel(planName.includes('3-Month') ? 'VIP 3M' : 'VIP 1M');
-    setSubscribedVipLevel((prev) => Math.max(prev, grantedVipLevel));
-    setVipGrowth((prev) => prev + bonusGrowth);
-    soundFx.playVictory();
+  const handleProposeRelationshipTag = async (
+    toUid: string,
+    tagType: RelationshipTagKey
+  ): Promise<{ ok: boolean; message: string }> => {
+    try {
+      const resp = await apiFetch('/api/tags/propose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ toUid, tagType }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        tags?: RelationshipTagSummary[];
+      };
+      if (!resp.ok || !data.ok) {
+        return { ok: false, message: data.error || 'Could not send tag invitation.' };
+      }
+      if (Array.isArray(data.tags)) setRelationshipTags(data.tags);
+      soundFx.playVictory();
+      return { ok: true, message: 'Relationship Tag invitation sent!' };
+    } catch {
+      return { ok: false, message: 'Network error sending relationship tag invitation.' };
+    }
+  };
+
+  const handleRespondRelationshipTag = async (tagId: string, accept: boolean) => {
+    try {
+      const resp = await apiFetch(`/api/tags/${encodeURIComponent(tagId)}/respond`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accept }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        tags?: RelationshipTagSummary[];
+        user?: Parameters<typeof applyServerUserSnapshot>[0];
+      };
+      if (!resp.ok || !data.ok) {
+        showToast(data.error || 'Unable to respond to invitation.');
+        return;
+      }
+      if (Array.isArray(data.tags)) setRelationshipTags(data.tags);
+      if (data.user) applyServerUserSnapshot(data.user);
+      soundFx.playVictory();
+      showToast(accept ? 'Relationship Tag activated!' : 'Tag invitation declined.');
+    } catch {
+      showToast('Network error responding to invitation.');
+    }
+  };
+
+  const handleEndRelationshipTag = async (tagId: string) => {
+    try {
+      const resp = await apiFetch(`/api/tags/${encodeURIComponent(tagId)}/end`, {
+        method: 'POST',
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        tags?: RelationshipTagSummary[];
+        user?: Parameters<typeof applyServerUserSnapshot>[0];
+      };
+      if (!resp.ok || !data.ok) {
+        showToast(data.error || 'Unable to remove relationship tag.');
+        return;
+      }
+      if (Array.isArray(data.tags)) setRelationshipTags(data.tags);
+      if (data.user) applyServerUserSnapshot(data.user);
+      showToast('Relationship Tag removed.');
+    } catch {
+      showToast('Network error removing tag.');
+    }
+  };
+
+  const handleCreatePaymentOrder = async (orderType: 'vip' | 'coins', packageId: string) => {
+    try {
+      const resp = await apiFetch('/api/payments/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orderType, packageId, screen: orderType }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        order?: ActivePaymentOrderPayload['order'];
+        upiConfig?: ActivePaymentOrderPayload['upiConfig'];
+      };
+      if (!resp.ok || !data.ok || !data.order || !data.upiConfig) {
+        showToast(data.error || 'Could not initiate payment order.');
+        return;
+      }
+      setActivePaymentOrder({ order: data.order, upiConfig: data.upiConfig });
+      void hydrateBackendState();
+    } catch {
+      showToast('Unable to connect to payment server.');
+    }
+  };
+
+  const handleReopenOrderModal = (order: BackendOrderRecord) => {
+    void (async () => {
+      try {
+        const resp = await apiFetch(
+          `/api/payments/upi-config?orderId=${encodeURIComponent(order.orderId)}`
+        );
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          expiresAt?: string | null;
+          upiConfig?: ActivePaymentOrderPayload['upiConfig'];
+        };
+        if (resp.ok && data.ok && data.upiConfig) {
+          setActivePaymentOrder({
+            order: {
+              orderId: order.orderId,
+              orderType: order.orderType,
+              packageId: order.packageId,
+              packageName: order.packageName,
+              amountInr: order.amountInr,
+              coinsAmount: order.coinsAmount,
+              grantedVipLevel: order.grantedVipLevel,
+              qrVersionId: data.upiConfig.currentVersionId ?? data.upiConfig.qrVersionId ?? order.qrVersionId ?? null,
+              expiresAt: data.expiresAt ?? order.expiresAt ?? null,
+              status: order.status,
+              utrNumber: order.utrNumber,
+            },
+            upiConfig: data.upiConfig,
+          });
+        } else {
+          showToast(data.error || 'This payment session is no longer active.');
+        }
+      } catch {
+        showToast('Could not load UPI QR details for this order.');
+      }
+    })();
+  };
+
+  const handleBuyCoins = async (packageId: string): Promise<{ ok: boolean; message: string }> => {
+    await handleCreatePaymentOrder('coins', packageId);
+    return {
+      ok: false,
+      message: 'Scan the official UPI QR and submit your UTR for Admin approval.',
+    };
+  };
+
+  const handleBuyVip = async (planId: string): Promise<{ ok: boolean; message: string }> => {
+    await handleCreatePaymentOrder('vip', planId);
+    return {
+      ok: false,
+      message: 'Scan the official UPI QR and submit your UTR. VIP activates only after Admin approval.',
+    };
   };
 
   const handleBuyShopItem = (item: ShopItem) => {
     if (coins < item.priceCoins || ownedItemIds.includes(item.id)) return;
-    setCoins((prev) => prev - item.priceCoins);
-    applyCoinSpend(item.priceCoins);
-    setOwnedItemIds((prev) => [...prev, item.id]);
-    setEquippedItems((prev) => ({ ...prev, [item.category]: item.id }));
-    soundFx.playVictory();
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/shop/buy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            itemId: item.id,
+            category: item.category,
+            priceCoins: item.priceCoins,
+            durationDays: item.durationDays,
+          }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Shop purchase failed.');
+          return;
+        }
+        if (data.user) applyServerUserSnapshot(data.user);
+        setOwnedItemIds((prev) => (prev.includes(item.id) ? prev : [...prev, item.id]));
+        if (item.durationDays) {
+          setOwnedItemExpiries((prev) => ({
+            ...prev,
+            [item.id]: Date.now() + item.durationDays! * 86_400_000,
+          }));
+        }
+        await apiFetch('/api/shop/equip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ category: item.category, itemId: item.id }),
+        }).catch(() => {});
+        setEquippedItems((prev) => ({ ...prev, [item.category]: item.id }));
+        soundFx.playVictory();
+        void hydrateBackendState();
+      } catch {
+        showToast('Network error purchasing shop item.');
+      }
+    })();
   };
 
   const handleEquipShopItem = (item: ShopItem) => {
     if (!ownedItemIds.includes(item.id)) return;
-    setEquippedItems((prev) => ({ ...prev, [item.category]: item.id }));
-    soundFx.playMove();
+    void (async () => {
+      try {
+        const resp = await apiFetch('/api/shop/equip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ category: item.category, itemId: item.id }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          user?: Parameters<typeof applyServerUserSnapshot>[0];
+        };
+        if (!resp.ok || !data.ok) {
+          showToast(data.error || 'Cannot equip item.');
+          return;
+        }
+        if (data.user) applyServerUserSnapshot(data.user);
+        setEquippedItems((prev) => ({ ...prev, [item.category]: item.id }));
+        soundFx.playMove();
+      } catch {
+        showToast('Network error equipping item.');
+      }
+    })();
   };
+
+  if (isCheckingSession) {
+    return (
+      <div className="relative flex min-h-screen items-center justify-center bg-gradient-to-b from-[#1E132B] via-[#130F1B] to-[#0B0912] p-4 text-slate-100">
+        <AmbientCanvas ambiance="saffron" energy={0.3} />
+        <div className="relative z-10 flex max-w-sm flex-col items-center gap-3 rounded-2xl border border-purple-400/20 bg-[#161024]/90 px-8 py-6 text-center backdrop-blur-md">
+          {sessionError ? (
+            <>
+              <p className="text-sm font-bold text-rose-300">Session Verification Failed</p>
+              <p className="text-xs text-slate-300">{sessionError}</p>
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSessionRetryNonce((n) => n + 1)}
+                  className="rounded-xl bg-gradient-to-r from-cyan-500 to-purple-500 px-4 py-2 text-xs font-extrabold text-white"
+                >
+                  Retry
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleLogout()}
+                  className="rounded-xl border border-white/15 bg-white/10 px-4 py-2 text-xs font-bold text-slate-200 hover:bg-white/15"
+                >
+                  Sign Out
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="h-7 w-7 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
+              <p className="text-xs font-semibold tracking-wide text-slate-300">
+                Verifying OG VELOCITY session...
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return (
-      <div className="relative min-h-screen bg-[#070B14] text-slate-100">
+      <div className="relative min-h-screen bg-gradient-to-b from-[#1E132B] via-[#130F1B] to-[#0B0912] text-slate-100">
         <AmbientCanvas ambiance="saffron" energy={0.35} />
         <div className="relative z-10">
-          <AuthScreen onLogin={handleLogin} />
+          <AuthScreen
+            onLogin={handleLogin}
+            onVerifyFirebaseUser={handleVerifyFirebaseUser}
+            initialError={authError}
+            onClearError={() => setAuthError(null)}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (isAdminRoute && ADMIN_ROLES.has(userRole)) {
+    return (
+      <div className="relative min-h-screen bg-gradient-to-b from-[#1E132B] via-[#130F1B] to-[#0B0912] text-slate-100">
+        <AdminPanel
+          authToken={authToken}
+          currentUserRole={userRole}
+          currentUserEmail={verifiedEmail}
+          onExitAdmin={exitAdminConsole}
+          onRefreshApp={() => void hydrateBackendState()}
+          onShopItemsChanged={() => void hydrateBackendState()}
+          onCustomGiftsChanged={() => void hydrateBackendState()}
+        />
+      </div>
+    );
+  }
+
+  if (appConfig?.maintenanceMode && !ADMIN_ROLES.has(userRole)) {
+    return (
+      <div className="relative flex min-h-screen items-center justify-center bg-gradient-to-b from-[#1E132B] via-[#130F1B] to-[#0B0912] p-6 text-slate-100">
+        <AmbientCanvas ambiance="saffron" energy={0.25} />
+        <div className="relative z-10 max-w-md rounded-3xl border border-amber-400/35 bg-[#161024]/90 p-7 text-center shadow-2xl backdrop-blur-md">
+          <h1 className="font-display text-xl font-black text-amber-300">
+            {appConfig.appName || 'OG VELOCITY'} Maintenance
+          </h1>
+          <p className="mt-3 text-sm text-slate-200">
+            {appConfig.maintenanceMessage || 'Scheduled maintenance is in progress. Please check back shortly.'}
+          </p>
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="mt-5 rounded-xl border border-white/15 bg-white/10 px-4 py-2 text-xs font-bold text-slate-200 hover:bg-white/15"
+          >
+            Sign Out
+          </button>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="relative min-h-screen bg-[#070B14] text-slate-100">
+    <div
+      className={`relative min-h-screen transition-colors ${
+        themeMode === 'light'
+          ? 'bg-gradient-to-b from-slate-100 via-slate-50 to-indigo-50 text-slate-900'
+          : 'bg-gradient-to-b from-[#1E132B] via-[#130F1B] to-[#0B0912] text-slate-100'
+      }`}
+    >
       <AmbientCanvas ambiance={activeRoom?.ambiance ?? 'saffron'} energy={0.42} />
 
       <div className="relative z-10 flex min-h-screen flex-col">
+        {appNotice && (
+          <div className="pointer-events-none fixed inset-x-4 top-3 z-[70] mx-auto max-w-md">
+            <div className="pointer-events-auto flex items-center justify-between gap-2 rounded-2xl border border-cyan-400/40 bg-[#0D1526]/95 px-4 py-2.5 text-xs font-semibold text-white shadow-xl backdrop-blur-md">
+              <span>{appNotice}</span>
+              <button
+                type="button"
+                onClick={() => setAppNotice(null)}
+                className="rounded-full p-0.5 text-slate-400 hover:text-white"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Global Top Notification Bar for Big Gifts (visible across all tabs) */}
         {bigGiftBanner && (
           <div className="pointer-events-none fixed inset-x-3 top-2 z-50 mx-auto max-w-xl">
@@ -2145,6 +5009,9 @@ export default function App() {
           {activeSection === 'home' && (
             <HomeHub
               userProfile={userProfile}
+              userRole={userRole}
+              notifications={notifications}
+              authToken={authToken}
               coins={coins}
               charm={charm}
               vipLevel={effectiveVipLevel}
@@ -2153,8 +5020,10 @@ export default function App() {
               userGiftsGivenCoins={userGiftsGivenCoins}
               dailyLoginClaimed={dailyLoginClaimed}
               ownedItemIds={ownedItemIds}
+              ownedItemExpiries={ownedItemExpiries}
               equippedItems={equippedItems}
               dailyTasks={dailyTasks}
+              claimedTaskChests={claimedTaskChests}
               friends={friends}
               rooms={rooms}
               onOpenMe={() => {
@@ -2169,6 +5038,8 @@ export default function App() {
                 setMeDefaultTab('shop');
                 setActiveSection('me');
               }}
+              onOpenAdmin={openAdminConsole}
+              onMarkNotificationsRead={handleMarkNotificationsRead}
               onBuyShopItem={handleBuyShopItem}
               onEquipShopItem={handleEquipShopItem}
               onJoinRoom={(roomId) => {
@@ -2177,22 +5048,34 @@ export default function App() {
                 }
               }}
               onSeeAllRooms={() => {
+                setClosedRoomNotice(null);
+                setRoomUrlParam(null);
                 setActiveRoomId(null);
                 setActiveSection('rooms');
               }}
               onClaimTask={handleClaimTask}
+              onClaimTaskChest={handleClaimTaskChest}
               onAddFriendByUid={handleAddFriendByUid}
               onInviteFriendToGame={handleInviteFriendToGame}
-              onEarnCoins={(amount) => setCoins((prev) => prev + amount)}
-              onInspectUser={(profile) => setInspectedUser(profile)}
+              onEarnCoins={() => {
+                void hydrateBackendState();
+              }}
+              onInspectUser={inspectUserProfile}
+              onInspectUserById={inspectUserById}
             />
           )}
 
           {activeSection === 'rooms' && (
             <VoiceRoomStage
+              authToken={authToken}
               rooms={rooms}
               activeRoom={activeRoom}
-              userUid={userProfile.uid}
+              closedRoomNotice={closedRoomNotice}
+              onDismissClosedRoomNotice={handleDismissClosedRoomNotice}
+              onReopenRoom={handleReopenRoom}
+              isAppAdmin={ADMIN_ROLES.has(userRole)}
+              shopItems={shopItems}
+              userUid={userProfile.publicId || userProfile.uid}
               userName={userProfile.name}
               coins={coins}
               charm={charm}
@@ -2210,6 +5093,18 @@ export default function App() {
               equippedSeatEffect={equippedSeatEffect}
               ownedItemIds={ownedItemIds}
               vipEntryBanner={vipEntryBanner}
+              relationshipTags={relationshipTags}
+              outgoingPendingFriendUids={outgoingPendingFriendUids}
+              roomVideoSync={roomVideoSync && roomVideoSync.roomId === activeRoom?.id ? roomVideoSync : null}
+              onPurchaseActionTag={handlePurchaseActionTag}
+              onRespondRelationshipTag={handleRespondRelationshipTag}
+              onEndRelationshipTag={handleEndRelationshipTag}
+              onUpdateActionRoom={(actionMode, slots) => {
+                ogRealtime.send({ type: 'room:action-update', actionMode, slots });
+              }}
+              onSyncVideoRoom={(payload) => {
+                ogRealtime.send({ type: 'room:video-sync', ...payload });
+              }}
               onDismissVipEntry={() => setVipEntryBanner(null)}
               onOpenRingShop={() => {
                 setMeDefaultTab('shop');
@@ -2221,7 +5116,7 @@ export default function App() {
               onOpenCreateRoom={() => setIsCreateModalOpen(true)}
               onJumpToMyRoom={() => {
                 const myRoom = rooms.find(
-                  (r) => r.isUserCreated || r.ownerUid === userProfile.uid
+                  (r) => r.isUserCreated || r.ownerUid === userProfile.uid || r.ownerUid === userProfile.publicId
                 );
                 if (myRoom && handleSelectRoom(myRoom.id)) {
                   setActiveSection('rooms');
@@ -2236,7 +5131,13 @@ export default function App() {
               onAddFriendByUid={handleAddFriendByUid}
               onJoinSeat={handleJoinSeat}
               onLeaveSeat={handleLeaveSeat}
-              onToggleMicMute={() => setIsMicMuted((m) => !m)}
+              onToggleMicMute={() => {
+                setIsMicMuted((m) => {
+                  const next = !m;
+                  ogRealtime.setMicMuted(next);
+                  return next;
+                });
+              }}
               onToggleSpeaker={handleToggleSpeaker}
               onToggleLockSeat={handleToggleLockSeat}
               onToggleMuteSeat={handleToggleMuteSeat}
@@ -2248,7 +5149,7 @@ export default function App() {
               onInviteFriendToRoom={handleInviteFriendToRoom}
               onSendGift={handleSendGift}
               onClaimRoomTask={handleClaimRoomTask}
-              onInspectUser={(profile) => setInspectedUser(profile)}
+              onInspectUser={inspectUserProfile}
               onMessageUser={handleMessageUser}
               onSendBackMessage={handleSendBackMessage}
               onSupportUser={handleSupportUser}
@@ -2259,6 +5160,7 @@ export default function App() {
               onEndPk={handleEndPk}
               onJoinPkTeam={handleJoinPkTeam}
               onVotePkTeam={handleVotePkTeam}
+              onReportUser={handleReportContent}
             />
           )}
 
@@ -2268,13 +5170,26 @@ export default function App() {
               coins={coins}
               gifts={allGifts}
               userProfile={userProfile}
+              authToken={authToken}
               equippedBubbleColor={equippedBubbleColor}
               equippedBubbleId={equippedItems.bubble}
+              pendingFriendRequests={pendingFriendRequests}
+              outgoingPendingFriendUids={outgoingPendingFriendUids}
+              sharedMoments={sharedMoments}
               onSelectThread={handleSelectChatThread}
               onSendChatMessage={handleSendChatMessage}
               onSendGift={handleSendGift}
               onJoinFriendVoiceRoom={handleJoinFriendVoiceRoom}
               onAddFriendByUid={handleAddFriendByUid}
+              onCancelFriendRequest={handleCancelFriendRequest}
+              onRespondFriendRequest={handleRespondFriendRequest}
+              onUnfriendUser={handleUnfriendUser}
+              onBlockUser={handleBlockUser}
+              onUnblockUser={handleUnblockUser}
+              onLoadOlderMessages={handleLoadOlderMessages}
+              hasMoreMessagesByUid={hasMoreMessagesByUid}
+              onInspectUserById={inspectUserById}
+              onReportUser={(uid, _name, reason) => handleReportContent('user', uid, reason)}
             />
           )}
 
@@ -2282,10 +5197,14 @@ export default function App() {
             <DiscoverSection
               moments={moments}
               rooms={rooms}
+              friends={friends}
               ownedItemIds={ownedItemIds}
+              shopItems={shopItems}
+              events={events}
+              authToken={authToken}
               onToggleLikeMoment={handleToggleLikeMoment}
               onAddMoment={handleAddMoment}
-              onInspectUser={(profile) => setInspectedUser(profile)}
+              onInspectUser={inspectUserProfile}
               onProposeCp={handleProposeCp}
               onOpenRingShop={() => {
                 setMeDefaultTab('shop');
@@ -2296,9 +5215,11 @@ export default function App() {
                   setActiveSection('rooms');
                 }
               }}
+              onJoinEvent={handleJoinEvent}
+              onReportContent={handleReportContent}
               onClaimGiftPack={() => {
-                setCoins((prev) => prev + 1_500);
-                soundFx.playVictory();
+                setActiveSection('home');
+                showToast('Complete Daily Tasks on Home to earn verified coins.');
               }}
             />
           )}
@@ -2306,33 +5227,57 @@ export default function App() {
           {activeSection === 'me' && (
             <MeProfileShop
               key={`me-${meDefaultTab}`}
+              authToken={authToken}
               userProfile={userProfile}
               coins={coins}
               charm={charm}
               vipGrowth={vipGrowth}
               vipLevel={effectiveVipLevel}
+              vipEarnedLevel={vipEarnedLevel}
+              vipStatus={vipStatus}
               vipLabel={vipLabel}
+              vipExpiresAt={vipExpiresAt}
+              vipGraceEndsAt={vipGraceEndsAt}
+              vipNextDecayAt={vipNextDecayAt}
+              vipInGracePeriod={vipInGracePeriod}
+              vipGraceDays={vipGraceDays}
+              vipDecayConfig={vipDecayConfig}
+              vipPointLedger={vipPointLedger}
+              vipSubscriptionHistory={vipSubscriptionHistory}
+              giftsReceivedCount={giftsReceivedCount}
+              accountStatus={accountStatus}
               ownedItemIds={ownedItemIds}
+              ownedItemExpiries={ownedItemExpiries}
               equippedItems={equippedItems}
+              shopItems={shopItems}
+              referralSummary={referralSummary}
               moments={moments}
               rooms={rooms}
               friends={friends}
               cpRequests={cpRequests}
+              cpRelationshipHistory={cpRelationshipHistory}
               customGifts={customGifts}
               receivedGiftIds={receivedGiftIds}
-              customQrUrl={customQrUrl}
+              vipPackages={vipPackages}
+              coinPackages={coinPackages}
+              orders={orders}
+              walletFrozen={walletFrozen}
+              themeMode={themeMode}
+              walletTransactions={walletTransactions}
               defaultTab={meDefaultTab}
               giftAnimationsEnabled={giftAnimationsEnabled}
               onToggleGiftAnimations={() => setGiftAnimationsEnabled((v) => !v)}
+              onToggleThemeMode={() => {
+                const next = themeMode === 'dark' ? 'light' : 'dark';
+                handleUpdateProfile({ themeMode: next });
+              }}
               onUpdateProfile={handleUpdateProfile}
+              onCreatePaymentOrder={handleCreatePaymentOrder}
+              onReopenOrderModal={handleReopenOrderModal}
               onBuyCoins={handleBuyCoins}
               onBuyVip={handleBuyVip}
               onBuyShopItem={handleBuyShopItem}
               onEquipShopItem={handleEquipShopItem}
-              onUploadQrCode={(dataUrl) => {
-                setCustomQrUrl(dataUrl);
-                soundFx.playVictory();
-              }}
               onJoinRoom={(roomId) => {
                 if (handleSelectRoom(roomId)) {
                   setActiveSection('rooms');
@@ -2342,14 +5287,17 @@ export default function App() {
               onRespondCpRequest={handleRespondCpRequest}
               onBreakCp={handleBreakCp}
               onSubmitCustomGift={handleSubmitCustomGift}
-              onReviewCustomGift={handleReviewCustomGift}
-              onInspectUser={(profile) => setInspectedUser(profile)}
+              onClaimReferralCode={handleClaimReferralCode}
+              onInviteFriendApp={handleInviteFriendApp}
+              onInspectUser={inspectUserProfile}
+              onInspectUserById={inspectUserById}
+              onLogout={handleLogout}
             />
           )}
         </main>
       </div>
 
-      {/* Floating Minimized Voice Room Pill (matches IMG_20261119_000851) */}
+      {/* Floating Minimized Voice Room Pill */}
       {activeRoom && activeSection !== 'rooms' && (
         <div className="fixed bottom-[76px] left-1/2 z-40 -translate-x-1/2">
           <div
@@ -2409,18 +5357,26 @@ export default function App() {
         profile={inspectedUser}
         currentUserUid={userProfile.uid}
         ownedItemIds={ownedItemIds}
+        shopItems={shopItems}
         onOpenRingShop={() => {
           setMeDefaultTab('shop');
           setActiveSection('me');
         }}
         onClose={() => setInspectedUser(null)}
-        onInspectUser={(profile) => setInspectedUser(profile)}
+        onInspectUser={inspectUserProfile}
+        onInspectUserById={inspectUserById}
         onJoinRoom={(roomId) => {
           if (handleSelectRoom(roomId)) {
             setActiveSection('rooms');
           }
         }}
         onAddFriend={(uid) => handleAddFriendByUid(uid)}
+        onCancelFriendRequest={(uid) => void handleCancelFriendRequest(uid)}
+        onAcceptFriendRequest={(uid) => handleRespondByPeerUid(uid, true)}
+        onDeclineFriendRequest={(uid) => handleRespondByPeerUid(uid, false)}
+        onUnfriendUser={(uid) => handleUnfriendUser(uid, inspectedUser?.avatar.name || uid)}
+        onBlockUser={(uid) => handleBlockUser(uid, inspectedUser?.avatar.name || uid)}
+        onUnblockUser={(uid) => handleUnblockUser(uid, inspectedUser?.avatar.name || uid)}
         onMessageUser={handleMessageUser}
         onSupportUser={handleSupportUser}
         onProposeCp={handleProposeCp}
@@ -2429,9 +5385,21 @@ export default function App() {
       <CreateRoomModal
         isOpen={isCreateModalOpen}
         coins={coins}
+        authToken={authToken}
         hasCreatedRoom={hasCreatedRoom}
         onClose={() => setIsCreateModalOpen(false)}
         onCreateRoom={handleCreateRoom}
+      />
+
+      <UpiPaymentModal
+        activeOrder={activePaymentOrder}
+        authToken={authToken}
+        onClose={() => setActivePaymentOrder(null)}
+        onProofSubmitted={(_order, message) => {
+          setActivePaymentOrder(null);
+          showToast(message);
+          void hydrateBackendState();
+        }}
       />
 
       {/* 4-Digit Room Passcode Unlock Modal */}

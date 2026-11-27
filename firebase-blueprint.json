@@ -1,0 +1,166 @@
+{
+  "entities": {
+    "TestConnection": {
+      "title": "TestConnection",
+      "description": "Connectivity health document read at startup.",
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Server/Super-Admin approved administrator marker.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["super_admin", "admin", "moderator", "support_staff"] },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "role", "active", "createdAt"]
+    },
+    "UserPublicProfile": {
+      "title": "UserPublicProfile",
+      "description": "Publicly visible non-PII user display metadata synced from backend.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "publicId": { "type": "string", "maxLength": 24, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "handle": { "type": "string", "minLength": 1, "maxLength": 48 },
+        "photoUrl": { "type": "string", "maxLength": 1024 },
+        "equippedFrameId": { "type": "string", "maxLength": 64 },
+        "vipLevel": { "type": "integer" },
+        "charmLevel": { "type": "integer" },
+        "online": { "type": "boolean" },
+        "lastSeenAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "publicId", "name", "handle", "online", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Private PII record isolated to owning user and administrators.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "publicId": { "type": "string", "maxLength": 24, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 254 },
+        "provider": { "type": "string", "enum": ["google", "facebook"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "publicId", "createdAt", "updatedAt"]
+    },
+    "UserPresence": {
+      "title": "UserPresence",
+      "description": "Realtime online/offline and last-seen indicator per user.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "publicId": { "type": "string", "maxLength": 24, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "online": { "type": "boolean" },
+        "lastSeenAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "publicId", "online", "lastSeenAt", "updatedAt"]
+    },
+    "FriendRequest": {
+      "title": "FriendRequest",
+      "description": "Peer-to-peer friend request state record.",
+      "type": "object",
+      "properties": {
+        "fromUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "toUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fromPublicId": { "type": "string", "maxLength": 24 },
+        "toPublicId": { "type": "string", "maxLength": 24 },
+        "status": { "type": "string", "enum": ["pending", "accepted", "rejected", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["fromUid", "toUid", "status", "createdAt", "updatedAt"]
+    },
+    "FriendEdge": {
+      "title": "FriendEdge",
+      "description": "Accepted friendship or block relationship between two users.",
+      "type": "object",
+      "properties": {
+        "userAUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userBUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "status": { "type": "string", "enum": ["accepted", "blocked"] },
+        "blockedByUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userAUid", "userBUid", "status", "createdAt", "updatedAt"]
+    },
+    "DirectChatThread": {
+      "title": "DirectChatThread",
+      "description": "Two-participant direct chat metadata thread.",
+      "type": "object",
+      "properties": {
+        "participants": { "type": "array" },
+        "lastMessageText": { "type": "string", "maxLength": 500 },
+        "lastSenderUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["participants", "createdAt", "updatedAt"]
+    },
+    "DirectChatMessage": {
+      "title": "DirectChatMessage",
+      "description": "Individual message inside a direct chat thread.",
+      "type": "object",
+      "properties": {
+        "senderUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "recipientUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "body": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "readAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["senderUid", "recipientUid", "body", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/test/{testId}": {
+      "schema": { "$ref": "#/entities/TestConnection" },
+      "description": "Connectivity test probe document."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Admin role marker docs checked by isAdmin()."
+    },
+    "/userPublicProfiles/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublicProfile" },
+      "description": "Non-PII public profile mirror for search & real-time presence."
+    },
+    "/userPrivate/{userId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Private PII mirror strictly restricted to owner or admin."
+    },
+    "/presence/{userId}": {
+      "schema": { "$ref": "#/entities/UserPresence" },
+      "description": "Real-time user online/offline & lastSeenAt indicator."
+    },
+    "/friendRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/FriendRequest" },
+      "description": "Incoming and outgoing friend request records."
+    },
+    "/friends/{edgeId}": {
+      "schema": { "$ref": "#/entities/FriendEdge" },
+      "description": "Accepted friendships and blocks between users."
+    },
+    "/chats/{chatId}": {
+      "schema": { "$ref": "#/entities/DirectChatThread" },
+      "description": "Two-participant DM thread metadata."
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/DirectChatMessage" },
+      "description": "Private messages within a two-participant chat thread."
+    }
+  }
+}

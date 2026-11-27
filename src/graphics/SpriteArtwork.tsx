@@ -3,6 +3,20 @@ import React from 'react';
 // Clean transparent cutouts extracted from user-provided OG VELOCITY asset sheets
 // Only the badge / ring / frame / gift itself is visible with zero background rectangle.
 
+function getVipBadgeGlowColor(level: number): string {
+  if (level <= 2) return 'rgba(56, 189, 248, 0.65)';
+  if (level <= 4) return 'rgba(52, 211, 153, 0.65)';
+  if (level <= 6) return 'rgba(168, 85, 247, 0.7)';
+  if (level <= 8) return 'rgba(251, 113, 133, 0.72)';
+  if (level <= 10) return 'rgba(251, 191, 36, 0.78)';
+  if (level <= 12) return 'rgba(249, 115, 22, 0.8)';
+  if (level <= 14) return 'rgba(236, 72, 153, 0.82)';
+  if (level === 15) return 'rgba(34, 211, 238, 0.88)';
+  if (level === 16) return 'rgba(168, 85, 247, 0.9)';
+  if (level === 17) return 'rgba(236, 72, 153, 0.92)';
+  return 'rgba(56, 189, 248, 0.96)';
+}
+
 export const VipBadgeArt: React.FC<{ level: number; size?: number; className?: string }> = ({
   level,
   size = 40,
@@ -10,12 +24,17 @@ export const VipBadgeArt: React.FC<{ level: number; size?: number; className?: s
 }) => {
   if (level <= 0) return null;
   const clamped = Math.max(1, Math.min(18, Math.round(level)));
+  const glowColor = getVipBadgeGlowColor(clamped);
   return (
     <img
       src={`/assets/cutouts/vip_${clamped}.png`}
       alt={`VIP ${clamped} Badge`}
-      style={{ height: size, width: 'auto' }}
-      className={`shrink-0 bg-transparent object-contain select-none ${className}`}
+      style={{
+        height: size,
+        width: 'auto',
+        filter: `drop-shadow(0 0 ${Math.max(5, Math.round(size * 0.24))}px ${glowColor})`,
+      }}
+      className={`vip-badge-shine shrink-0 bg-transparent object-contain select-none ${className}`}
       draggable={false}
     />
   );
@@ -77,12 +96,13 @@ export const RingSpriteArt: React.FC<{
   ringNumber: number;
   size?: number;
   alt?: string;
+  imageUrl?: string;
   className?: string;
-}> = ({ ringNumber, size = 64, alt = 'Ring', className = '' }) => {
+}> = ({ ringNumber, size = 64, alt = 'Ring', imageUrl, className = '' }) => {
   const clamped = Math.max(1, Math.min(20, Math.round(ringNumber)));
   return (
     <img
-      src={`/assets/cutouts/ring_${clamped}.png`}
+      src={imageUrl || `/assets/cutouts/ring_${clamped}.png`}
       alt={alt}
       style={{ height: size, width: size }}
       className={`shrink-0 bg-transparent object-contain select-none ${className}`}
@@ -95,12 +115,13 @@ export const SeatFrameSpriteArt: React.FC<{
   frameNumber: number;
   size?: number;
   alt?: string;
+  imageUrl?: string;
   className?: string;
-}> = ({ frameNumber, size = 76, alt = 'Seat Frame', className = '' }) => {
+}> = ({ frameNumber, size = 76, alt = 'Seat Frame', imageUrl, className = '' }) => {
   const clamped = Math.max(1, Math.min(20, Math.round(frameNumber)));
   return (
     <img
-      src={`/assets/cutouts/seatframes/seat_frame_${clamped}.png`}
+      src={imageUrl || `/assets/cutouts/seatframes/seat_frame_${clamped}.png`}
       alt={alt}
       style={{ height: size, width: size }}
       className={`pointer-events-none shrink-0 bg-transparent object-contain select-none ${className}`}
@@ -235,22 +256,22 @@ export const CharmBadgePill: React.FC<{
         : charm.toLocaleString();
 
   return (
-    <div className={`relative inline-flex items-center select-none ${className}`}>
+    <div className={`relative inline-flex shrink-0 items-center overflow-visible select-none ${className}`}>
       {/* Horizontal purple-indigo pill with golden trim */}
       <div
-        className="ml-5 flex h-7 items-center rounded-r-full border border-amber-400/80 pr-4 pl-7 shadow-md"
+        className="ml-5 flex h-7 shrink-0 items-center rounded-r-full border border-amber-400/80 pr-3.5 pl-6 shadow-md"
         style={{
           background: 'linear-gradient(90deg, #5B21B6 0%, #4338CA 65%, #312E81 100%)',
           boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.22), 0 2px 10px rgba(91,33,182,0.45)',
         }}
       >
-        <span className="font-mono-tabular text-sm font-extrabold tracking-tight text-white">
+        <span className="font-mono-tabular whitespace-nowrap text-xs sm:text-sm font-extrabold tracking-tight text-white">
           {formatted}
         </span>
       </div>
 
       {/* Overlapping hexagonal crown charm badge + level circle */}
-      <div className="absolute left-0 flex items-center justify-center">
+      <div className="pointer-events-none absolute left-0 flex items-center justify-center">
         <div
           className="flex h-9 w-9 items-center justify-center shadow-lg"
           style={{
@@ -396,3 +417,66 @@ export const CpHeartConnectorArt: React.FC<{
     </div>
   );
 };
+
+export const normalizeRelationshipSpriteKey = (
+  tagType?: string
+): 'bro' | 'bestie' | 'sister' | 'soulmate' | 'lover' | 'confident' => {
+  const clean = String(tagType || '').trim().toLowerCase();
+  if (clean === 'cp_partner' || clean === 'lover') return 'lover';
+  if (clean === 'bestie') return 'bestie';
+  if (clean === 'sister') return 'sister';
+  if (clean === 'soulmate') return 'soulmate';
+  if (clean === 'confident') return 'confident';
+  return 'bro';
+};
+
+export const RelationshipTagSpriteArt: React.FC<{
+  tagType?: string;
+  level?: number;
+  showCrest?: boolean;
+  size?: number;
+  className?: string;
+}> = ({ tagType = 'bro', level = 1, showCrest = false, size = 44, className = '' }) => {
+  const key = normalizeRelationshipSpriteKey(tagType);
+  const clamped = Math.max(1, Math.min(10, Math.round(level || 1)));
+  const src = showCrest
+    ? `/assets/cutouts/tags/${key}/crest.png`
+    : `/assets/cutouts/tags/${key}/lv${clamped}.png`;
+
+  return (
+    <img
+      src={src}
+      alt={`${key} ${showCrest ? 'crest' : `Lv.${clamped}`}`}
+      width={size}
+      height={size}
+      style={{ width: size, height: showCrest ? Math.round(size * 0.85) : size }}
+      className={`inline-block shrink-0 object-contain select-none drop-shadow-[0_2px_8px_rgba(0,0,0,0.45)] ${className}`}
+      draggable={false}
+    />
+  );
+};
+
+export const TagFistConnectorArt: React.FC<{
+  size?: number;
+  level?: number;
+  label?: string;
+  className?: string;
+}> = ({ size = 46, level, label, className = '' }) => {
+  return (
+    <div className={`relative inline-flex flex-col items-center justify-center select-none ${className}`}>
+      <img
+        src="/assets/cutouts/tag_connector_fist.png"
+        alt={label ? `${label} Tag Connector` : 'Tag Bond Connector'}
+        style={{ width: Math.round(size * 1.48), height: size }}
+        className="object-contain drop-shadow-[0_0_10px_rgba(56,189,248,0.65)]"
+        draggable={false}
+      />
+      {(label || (level && level >= 1)) && (
+        <span className=" -mt-1.5 rounded-full border border-cyan-300/60 bg-[#0B1733]/95 px-1.5 py-0.2 font-mono-tabular text-[8px] font-black text-cyan-200 shadow">
+          {label ? `${label}` : ''}{level && level >= 1 ? ` Lv.${level}` : ''}
+        </span>
+      )}
+    </div>
+  );
+};
+

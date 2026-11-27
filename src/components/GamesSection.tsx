@@ -5,9 +5,10 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleDot,
-  Flame,
-  Fuel,
+  Dices,
   Maximize2,
+  Mic,
+  MicOff,
   Play,
   RotateCcw,
   ShieldAlert,
@@ -15,32 +16,37 @@ import {
   Trophy,
   UserPlus,
   Users,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import carromCoverImg from '../assets/images/game_cover_carrom_1795082843964.jpg';
+import ludoCoverImg from '../assets/images/game_cover_ludo_1795771427952.jpg';
 import poolCoverImg from '../assets/images/game_cover_pool_1795082844449.jpg';
 import racingCoverImg from '../assets/images/game_cover_racing_1795082843175.jpg';
-import truthDareCoverImg from '../assets/images/game_cover_truth_dare_1795082843109.jpg';
-import { AVATAR_ROSTER, USER_PROFILE } from '../data/zayroData';
+import { USER_PROFILE } from '../data/zayroData';
 import { AvatarArt } from '../graphics/AvatarArt';
 import { ZayroCoinArt } from '../graphics/SpriteArtwork';
-import type { FriendRecord } from '../types';
+import type { AvatarConfig, FriendRecord, GameVoicePeer } from '../types';
+import { ogRealtime } from '../utils/realtimeClient';
 import { soundFx } from '../utils/soundFx';
 
 interface GamesSectionProps {
   friends?: FriendRecord[];
+  currentUserUid?: string;
+  currentUserName?: string;
+  authToken?: string | null;
   onInviteFriend?: (friend: FriendRecord, gameTitle: string) => void;
   onEarnCoins: (amount: number, reason: string) => void;
 }
 
-type GameId = 'carrom' | 'pool' | 'racing' | 'truth-dare';
+type GameId = 'carrom' | 'pool' | 'racing' | 'ludo';
 type GamePhase = 'idle' | 'playing' | 'won' | 'lost';
 
 interface SquadPlayer {
   id: string;
   name: string;
   color: string;
-  isBot?: boolean;
 }
 
 const SQUAD_COLORS = ['#F59E0B', '#38BDF8', '#EC4899', '#34D399'];
@@ -52,59 +58,55 @@ const ARENA_BACKGROUNDS: Record<GameId, string> = {
     'radial-gradient(circle at 22% 20%, rgba(14,165,233,0.28) 0%, transparent 45%), radial-gradient(circle at 80% 78%, rgba(16,185,129,0.24) 0%, transparent 48%), linear-gradient(160deg, #061726 0%, #0A2538 52%, #050C14 100%)',
   racing:
     'radial-gradient(circle at 50% 15%, rgba(236,72,153,0.32) 0%, transparent 45%), radial-gradient(circle at 85% 85%, rgba(34,211,238,0.25) 0%, transparent 45%), linear-gradient(160deg, #130728 0%, #240B3B 50%, #070B14 100%)',
-  'truth-dare':
-    'radial-gradient(circle at 20% 25%, rgba(244,63,94,0.28) 0%, transparent 45%), radial-gradient(circle at 82% 75%, rgba(168,85,247,0.28) 0%, transparent 48%), linear-gradient(160deg, #1A0826 0%, #2B0E38 50%, #090612 100%)',
-};
-
-const GameFuelGauge: React.FC<{ fuel: number; label?: string }> = ({ fuel, label = 'Fuel' }) => {
-  const clamped = Math.max(0, Math.min(100, Math.round(fuel)));
-  const barTone =
-    clamped > 50
-      ? 'from-emerald-400 to-cyan-400'
-      : clamped > 25
-        ? 'from-amber-400 to-orange-400'
-        : 'from-rose-500 to-red-500';
-  const textTone =
-    clamped > 50 ? 'text-emerald-300' : clamped > 25 ? 'text-amber-300' : 'text-rose-400 animate-pulse';
-
-  return (
-    <div className="rounded-xl border border-white/10 bg-[#070B14]/85 px-3 py-2">
-      <div className="mb-1 flex items-center justify-between text-[11px] font-bold">
-        <span className="inline-flex items-center gap-1.5 text-slate-200">
-          <Fuel className={`h-3.5 w-3.5 ${textTone}`} />
-          <span>{label}</span>
-        </span>
-        <span className={`font-mono-tabular ${textTone}`}>{clamped}%</span>
-      </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
-        <div
-          className={`h-full rounded-full bg-gradient-to-r transition-all duration-200 ${barTone}`}
-          style={{ width: `${clamped}%` }}
-        />
-      </div>
-    </div>
-  );
+  ludo:
+    'radial-gradient(circle at 20% 25%, rgba(245,158,11,0.26) 0%, transparent 45%), radial-gradient(circle at 82% 75%, rgba(16,185,129,0.24) 0%, transparent 48%), linear-gradient(160deg, #0E172A 0%, #1A1236 52%, #070B14 100%)',
 };
 
 const GameStartOverlay: React.FC<{
   title: string;
   rule: string;
   accentClass: string;
+  realPlayerCount?: number;
+  onInviteFriends?: () => void;
   onStart: () => void;
-}> = ({ title, rule, accentClass, onStart }) => (
-  <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#060913]/82 p-5 text-center backdrop-blur-sm">
-    <div className="font-display text-xl font-black text-white">{title}</div>
-    <p className="mt-1.5 max-w-xs text-xs text-slate-300">{rule}</p>
-    <button
-      type="button"
-      onClick={onStart}
-      className={`mt-4 inline-flex items-center gap-2 rounded-full px-6 py-2.5 text-xs font-black text-slate-950 shadow-xl transition-transform hover:scale-105 ${accentClass}`}
-    >
-      <Play className="h-4 w-4 fill-slate-950" />
-      <span>Start Game</span>
-    </button>
-  </div>
-);
+}> = ({ title, rule, accentClass, realPlayerCount = 2, onInviteFriends, onStart }) => {
+  const needsMorePlayers = realPlayerCount < 2;
+  return (
+    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#060913]/85 p-5 text-center backdrop-blur-sm">
+      <div className="font-display text-xl font-black text-white">{title}</div>
+      <p className="mt-1.5 max-w-xs text-xs text-slate-300">{rule}</p>
+      <div className="mt-2 inline-flex items-center gap-1.5 rounded-full border border-amber-400/35 bg-amber-500/15 px-3 py-1 text-[10px] font-bold text-amber-200">
+        <span>Rewards: Winner +2,500 Coins · Participant +500 Coins</span>
+      </div>
+      {needsMorePlayers ? (
+        <div className="mt-4 space-y-2.5">
+          <div className="rounded-xl border border-rose-400/40 bg-rose-500/15 px-3 py-2 text-[11px] font-semibold text-rose-200">
+            Invite at least 1 real friend to start a live multiplayer match (AI bots disabled).
+          </div>
+          {onInviteFriends && (
+            <button
+              type="button"
+              onClick={onInviteFriends}
+              className="inline-flex items-center gap-1.5 rounded-full bg-gradient-to-r from-cyan-400 to-teal-400 px-5 py-2 text-xs font-black text-slate-950 shadow-lg hover:brightness-110"
+            >
+              <UserPlus className="h-4 w-4" />
+              <span>Invite Real Friend</span>
+            </button>
+          )}
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={onStart}
+          className={`mt-4 inline-flex items-center gap-2 rounded-full px-6 py-2.5 text-xs font-black text-slate-950 shadow-xl transition-transform hover:scale-105 ${accentClass}`}
+        >
+          <Play className="h-4 w-4 fill-slate-950" />
+          <span>Start Match ({realPlayerCount} Real Players)</span>
+        </button>
+      )}
+    </div>
+  );
+};
 
 const GameOutcomeOverlay: React.FC<{
   phase: 'won' | 'lost';
@@ -142,7 +144,7 @@ const GameOutcomeOverlay: React.FC<{
 );
 
 // ============================================================
-// 1. MULTIPLAYER CARROM BOARD (2-4 Players, Fuel + Win/Loss)
+// 1. MULTIPLAYER CARROM BOARD (2-4 Players + Win/Loss)
 // ============================================================
 interface Disc {
   x: number;
@@ -156,8 +158,9 @@ interface Disc {
 
 const CarromBoardGame: React.FC<{
   players: SquadPlayer[];
+  onInviteFriends?: () => void;
   onReward: (coins: number, msg: string) => void;
-}> = ({ players, onReward }) => {
+}> = ({ players, onInviteFriends, onReward }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const discsRef = useRef<Disc[]>([]);
   const draggingRef = useRef(false);
@@ -167,7 +170,7 @@ const CarromBoardGame: React.FC<{
   const pocketedOnTurnRef = useRef(false);
   const turnRef = useRef(0);
   const phaseRef = useRef<GamePhase>('idle');
-  const fuelRef = useRef(100);
+  const foulsRef = useRef(0);
   const scoreTotalRef = useRef(0);
   const onRewardRef = useRef(onReward);
 
@@ -176,7 +179,7 @@ const CarromBoardGame: React.FC<{
   }, [onReward]);
 
   const [phase, setPhase] = useState<GamePhase>('idle');
-  const [fuel, setFuel] = useState(100);
+  const [fouls, setFouls] = useState(0);
   const [turnIdx, setTurnIdx] = useState(0);
   const [scores, setScores] = useState<number[]>(() => players.map(() => 0));
   const [status, setStatus] = useState('Press Start to launch your Carrom match!');
@@ -185,6 +188,7 @@ const CarromBoardGame: React.FC<{
   const SIZE = 420;
   const PAD = 34;
   const TARGET_SCORE = 60;
+  const MAX_FOULS = 3;
 
   const setupBoard = (nextPhase: GamePhase) => {
     const cx = SIZE / 2;
@@ -230,11 +234,11 @@ const CarromBoardGame: React.FC<{
     shotPendingRef.current = false;
     pocketedOnTurnRef.current = false;
     turnRef.current = 0;
-    fuelRef.current = 100;
+    foulsRef.current = 0;
     scoreTotalRef.current = 0;
     phaseRef.current = nextPhase;
     setPhase(nextPhase);
-    setFuel(100);
+    setFouls(0);
     setTurnIdx(0);
     setStrikerX(210);
     setScores(players.map(() => 0));
@@ -307,18 +311,17 @@ const CarromBoardGame: React.FC<{
                 d.x = strikerPosRef.current;
                 d.y = SIZE - 76;
                 pocketedOnTurnRef.current = false;
-                fuelRef.current = Math.max(0, fuelRef.current - 12);
-                setFuel(fuelRef.current);
-                setStatus(`${players[turnRef.current]?.name || 'Player'} striker foul (-12% fuel)!`);
+                foulsRef.current += 1;
+                setFouls(foulsRef.current);
+                setStatus(
+                  `${players[turnRef.current]?.name || 'Player'} striker foul (${foulsRef.current}/${MAX_FOULS})!`
+                );
               } else {
                 d.pocketed = true;
                 d.vx = 0;
                 d.vy = 0;
                 pocketedOnTurnRef.current = true;
                 const pts = d.color === 'queen' ? 50 : d.color === 'white' ? 20 : 10;
-                const fuelGain = d.color === 'queen' ? 25 : 14;
-                fuelRef.current = Math.min(100, fuelRef.current + fuelGain);
-                setFuel(fuelRef.current);
                 const activeIdx = turnRef.current;
                 scoreTotalRef.current += pts;
                 setScores((prev) => prev.map((sc, i) => (i === activeIdx ? sc + pts : sc)));
@@ -327,11 +330,11 @@ const CarromBoardGame: React.FC<{
                   `${players[activeIdx]?.name || 'Player'} pocketed ${d.color} (+${pts * 10} Coins)`
                 );
                 soundFx.playVictory();
-                setStatus(`${players[activeIdx]?.name || 'Player'} pocketed ${d.color.toUpperCase()} (+${fuelGain}% fuel)!`);
+                setStatus(`${players[activeIdx]?.name || 'Player'} pocketed ${d.color.toUpperCase()} (+${pts} pts)!`);
                 if (scoreTotalRef.current >= TARGET_SCORE) {
                   phaseRef.current = 'won';
                   setPhase('won');
-                  onRewardRef.current(800, 'Carrom Match Victory Bonus (+800 Coins)');
+                  onRewardRef.current(2500, 'Carrom Match Victory Bonus (+2,500 Winner / +500 Participant)');
                 }
               }
             }
@@ -377,10 +380,10 @@ const CarromBoardGame: React.FC<{
           }
           if (shotPendingRef.current) {
             shotPendingRef.current = false;
-            if (fuelRef.current <= 0 && phaseRef.current === 'playing') {
+            if (foulsRef.current >= MAX_FOULS && phaseRef.current === 'playing') {
               phaseRef.current = 'lost';
               setPhase('lost');
-              setStatus('Out of Fuel! Press Retry for a fresh board.');
+              setStatus(`Too many fouls (${MAX_FOULS}/${MAX_FOULS})! Press Retry for a fresh board.`);
             } else if (!pocketedOnTurnRef.current) {
               const nextTurn = (turnRef.current + 1) % players.length;
               turnRef.current = nextTurn;
@@ -616,8 +619,6 @@ const CarromBoardGame: React.FC<{
         striker.vy = (dy / dist) * power;
         shotPendingRef.current = true;
         pocketedOnTurnRef.current = false;
-        fuelRef.current = Math.max(0, fuelRef.current - 16);
-        setFuel(fuelRef.current);
         soundFx.playMove();
       }
     }
@@ -651,7 +652,14 @@ const CarromBoardGame: React.FC<{
         })}
       </div>
 
-      <GameFuelGauge fuel={fuel} label={`Striker Fuel · Score ${totalScore}/${TARGET_SCORE}`} />
+      <div className="flex items-center justify-between rounded-xl border border-white/10 bg-[#070B14]/85 px-3 py-2 text-xs font-bold">
+        <span className="text-amber-300">
+          Target: {totalScore}/{TARGET_SCORE} pts
+        </span>
+        <span className={fouls >= 2 ? 'text-rose-400' : 'text-slate-300'}>
+          Fouls: {fouls}/{MAX_FOULS}
+        </span>
+      </div>
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs font-semibold text-amber-300">{status}</div>
@@ -678,8 +686,10 @@ const CarromBoardGame: React.FC<{
         {phase === 'idle' && (
           <GameStartOverlay
             title="Carrom Strike Arena"
-            rule={`Score ${TARGET_SCORE} points before your Striker Fuel hits 0%. Pocketing discs restores fuel!`}
+            rule={`Score ${TARGET_SCORE} points to win! Avoid ${MAX_FOULS} striker pocket fouls.`}
             accentClass="bg-gradient-to-r from-amber-400 to-yellow-300"
+            realPlayerCount={players.length}
+            onInviteFriends={onInviteFriends}
             onStart={() => setupBoard('playing')}
           />
         )}
@@ -689,8 +699,8 @@ const CarromBoardGame: React.FC<{
             headline={phase === 'won' ? 'VICTORY!' : 'GAME OVER'}
             detail={
               phase === 'won'
-                ? `Squad cleared ${totalScore} Carrom points with ${fuel}% fuel left! (+800 Bonus Coins)`
-                : `Striker fuel ran dry at ${totalScore}/${TARGET_SCORE} points.`
+                ? `Squad cleared ${totalScore} Carrom points! (+2,500 Winner / +500 Participant Coins)`
+                : `Game over after ${MAX_FOULS} striker fouls at ${totalScore}/${TARGET_SCORE} points.`
             }
             onRetry={() => setupBoard('playing')}
           />
@@ -723,12 +733,13 @@ const CarromBoardGame: React.FC<{
 };
 
 // ============================================================
-// 2. MULTIPLAYER 8-BALL POOL TABLE (Sapphire Cloth + Fuel + Win/Loss)
+// 2. MULTIPLAYER 8-BALL POOL TABLE (Sapphire Cloth + Win/Loss)
 // ============================================================
 const EightBallPoolGame: React.FC<{
   players: SquadPlayer[];
+  onInviteFriends?: () => void;
   onReward: (coins: number, msg: string) => void;
-}> = ({ players, onReward }) => {
+}> = ({ players, onInviteFriends, onReward }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ballsRef = useRef<
     Array<{ x: number; y: number; vx: number; vy: number; num: number; color: string; pocketed: boolean }>
@@ -739,7 +750,7 @@ const EightBallPoolGame: React.FC<{
   const pocketedOnTurnRef = useRef(false);
   const turnRef = useRef(0);
   const phaseRef = useRef<GamePhase>('idle');
-  const fuelRef = useRef(100);
+  const scratchesRef = useRef(0);
   const totalPocketsRef = useRef(0);
   const onRewardRef = useRef(onReward);
 
@@ -748,7 +759,7 @@ const EightBallPoolGame: React.FC<{
   }, [onReward]);
 
   const [phase, setPhase] = useState<GamePhase>('idle');
-  const [fuel, setFuel] = useState(100);
+  const [scratches, setScratches] = useState(0);
   const [turnIdx, setTurnIdx] = useState(0);
   const [playerPockets, setPlayerPockets] = useState<number[]>(() => players.map(() => 0));
   const [poolMsg, setPoolMsg] = useState('Press Start to rack the Sapphire Pool Table!');
@@ -757,6 +768,7 @@ const EightBallPoolGame: React.FC<{
   const H = 260;
   const RAIL = 22;
   const TARGET_BALLS = 4;
+  const MAX_SCRATCHES = 3;
 
   const initPool = (nextPhase: GamePhase) => {
     const rackColors = ['#FACC15', '#2563EB', '#DC2626', '#7C3AED', '#F97316', '#16A34A', '#111827'];
@@ -789,16 +801,16 @@ const EightBallPoolGame: React.FC<{
     shotPendingRef.current = false;
     pocketedOnTurnRef.current = false;
     turnRef.current = 0;
-    fuelRef.current = 100;
+    scratchesRef.current = 0;
     totalPocketsRef.current = 0;
     phaseRef.current = nextPhase;
     setPhase(nextPhase);
-    setFuel(100);
+    setScratches(0);
     setTurnIdx(0);
     setPlayerPockets(players.map(() => 0));
     setPoolMsg(
       nextPhase === 'playing'
-        ? `${players[0]?.name}'s Break · Pocket ${TARGET_BALLS} balls before Cue Fuel runs out!`
+        ? `${players[0]?.name}'s Break · Pocket ${TARGET_BALLS} balls to clear the table!`
         : 'Press Start to rack the Sapphire Pool Table!'
     );
   };
@@ -863,17 +875,17 @@ const EightBallPoolGame: React.FC<{
                 b.vx = 0;
                 b.vy = 0;
                 pocketedOnTurnRef.current = false;
-                fuelRef.current = Math.max(0, fuelRef.current - 15);
-                setFuel(fuelRef.current);
-                setPoolMsg(`${players[turnRef.current]?.name} scratched cue ball (-15% fuel)!`);
+                scratchesRef.current += 1;
+                setScratches(scratchesRef.current);
+                setPoolMsg(
+                  `${players[turnRef.current]?.name} scratched cue ball (${scratchesRef.current}/${MAX_SCRATCHES})!`
+                );
               } else {
                 b.pocketed = true;
                 b.vx = 0;
                 b.vy = 0;
                 pocketedOnTurnRef.current = true;
                 totalPocketsRef.current += 1;
-                fuelRef.current = Math.min(100, fuelRef.current + 18);
-                setFuel(fuelRef.current);
                 const activeIdx = turnRef.current;
                 setPlayerPockets((prev) => prev.map((c, i) => (i === activeIdx ? c + 1 : c)));
                 onRewardRef.current(
@@ -881,11 +893,11 @@ const EightBallPoolGame: React.FC<{
                   `${players[activeIdx]?.name} pocketed ball #${b.num} (+250 Coins)`
                 );
                 soundFx.playVictory();
-                setPoolMsg(`${players[activeIdx]?.name} pocketed #${b.num} (+18% fuel)!`);
+                setPoolMsg(`${players[activeIdx]?.name} pocketed #${b.num}!`);
                 if (totalPocketsRef.current >= TARGET_BALLS) {
                   phaseRef.current = 'won';
                   setPhase('won');
-                  onRewardRef.current(1000, '8-Ball Pool Match Victory (+1,000 Coins)');
+                  onRewardRef.current(2500, '8-Ball Pool Match Victory (+2,500 Winner / +500 Participant)');
                 }
               }
             }
@@ -921,10 +933,10 @@ const EightBallPoolGame: React.FC<{
 
         if (!anyMoving && shotPendingRef.current && !draggingRef.current) {
           shotPendingRef.current = false;
-          if (fuelRef.current <= 0 && phaseRef.current === 'playing') {
+          if (scratchesRef.current >= MAX_SCRATCHES && phaseRef.current === 'playing') {
             phaseRef.current = 'lost';
             setPhase('lost');
-            setPoolMsg('Out of Cue Fuel! Hit Retry to rack again.');
+            setPoolMsg(`Too many scratches (${MAX_SCRATCHES}/${MAX_SCRATCHES})! Hit Retry to rack again.`);
           } else if (!pocketedOnTurnRef.current) {
             const next = (turnRef.current + 1) % players.length;
             turnRef.current = next;
@@ -1086,7 +1098,14 @@ const EightBallPoolGame: React.FC<{
         ))}
       </div>
 
-      <GameFuelGauge fuel={fuel} label={`Cue Fuel · Pocketed ${totalPocketed}/${TARGET_BALLS}`} />
+      <div className="flex items-center justify-between rounded-xl border border-white/10 bg-[#070B14]/85 px-3 py-2 text-xs font-bold">
+        <span className="text-sky-300">
+          Pocketed: {totalPocketed}/{TARGET_BALLS} balls
+        </span>
+        <span className={scratches >= 2 ? 'text-rose-400' : 'text-slate-300'}>
+          Scratches: {scratches}/{MAX_SCRATCHES}
+        </span>
+      </div>
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-xs font-semibold text-sky-300">{poolMsg}</span>
@@ -1130,8 +1149,6 @@ const EightBallPoolGame: React.FC<{
                 cue.vy = (dy / d) * p;
                 shotPendingRef.current = true;
                 pocketedOnTurnRef.current = false;
-                fuelRef.current = Math.max(0, fuelRef.current - 16);
-                setFuel(fuelRef.current);
                 soundFx.playMove();
               }
             }
@@ -1143,8 +1160,10 @@ const EightBallPoolGame: React.FC<{
         {phase === 'idle' && (
           <GameStartOverlay
             title="Sapphire 8-Ball Lounge"
-            rule={`Pocket ${TARGET_BALLS} balls before Cue Fuel runs out. Every pocketed ball refills +18% fuel!`}
+            rule={`Pocket ${TARGET_BALLS} balls to win! Avoid scratching the cue ball ${MAX_SCRATCHES} times.`}
             accentClass="bg-gradient-to-r from-sky-400 to-cyan-300"
+            realPlayerCount={players.length}
+            onInviteFriends={onInviteFriends}
             onStart={() => initPool('playing')}
           />
         )}
@@ -1154,8 +1173,8 @@ const EightBallPoolGame: React.FC<{
             headline={phase === 'won' ? 'TABLE CLEARED!' : 'GAME OVER'}
             detail={
               phase === 'won'
-                ? `Victory! ${totalPocketed} balls pocketed with ${fuel}% Cue Fuel left. (+1,000 Bonus Coins)`
-                : `Cue Fuel depleted after pocketing ${totalPocketed}/${TARGET_BALLS} balls.`
+                ? `Victory! ${totalPocketed} balls pocketed! (+2,500 Winner / +500 Participant Coins)`
+                : `Game over after ${MAX_SCRATCHES} cue-ball scratches (${totalPocketed}/${TARGET_BALLS} pocketed).`
             }
             onRetry={() => initPool('playing')}
           />
@@ -1166,26 +1185,23 @@ const EightBallPoolGame: React.FC<{
 };
 
 // ============================================================
-// 3. MULTIPLAYER SUNSET TURBO RACING (Fuel Pickups + 300m Win/Loss)
+// 3. MULTIPLAYER SUNSET TURBO RACING (300m Win/Loss)
 // ============================================================
 const CarRacingGame: React.FC<{
   players: SquadPlayer[];
+  onInviteFriends?: () => void;
   onReward: (coins: number, msg: string) => void;
-}> = ({ players, onReward }) => {
+}> = ({ players, onInviteFriends, onReward }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const laneRef = useRef<number>(1);
   const distanceRef = useRef<number>(0);
-  const fuelRef = useRef<number>(100);
   const phaseRef = useRef<GamePhase>('idle');
-  const lossReasonRef = useRef<'crash' | 'fuel'>('crash');
   const onRewardRef = useRef(onReward);
 
   const [phase, setPhase] = useState<GamePhase>('idle');
-  const [fuel, setFuel] = useState(100);
   const [lane, setLane] = useState(1);
   const [distance, setDistance] = useState(0);
   const [racerDistances, setRacerDistances] = useState<number[]>(() => players.map(() => 0));
-  const [lossReason, setLossReason] = useState<'crash' | 'fuel'>('crash');
 
   useEffect(() => {
     onRewardRef.current = onReward;
@@ -1207,12 +1223,10 @@ const CarRacingGame: React.FC<{
 
   const resetRace = (nextPhase: GamePhase) => {
     distanceRef.current = 0;
-    fuelRef.current = 100;
     laneRef.current = 1;
     phaseRef.current = nextPhase;
     setLane(1);
     setDistance(0);
-    setFuel(100);
     setRacerDistances(players.map(() => 0));
     setPhase(nextPhase);
   };
@@ -1253,8 +1267,6 @@ const CarRacingGame: React.FC<{
       { lane: 2, y: -200, color: '#F43F5E' },
     ];
 
-    const fuelCan = { lane: 0, y: -140 };
-
     let raf = 0;
     const tick = () => {
       if (phaseRef.current === 'playing') {
@@ -1262,20 +1274,6 @@ const CarRacingGame: React.FC<{
         roadOffset = (roadOffset + 7) % 44;
         const targetX = LANES[laneRef.current];
         carX += (targetX - carX) * 0.22;
-
-        // Smooth fuel burn (~10% per 30m) synced strictly outside other setState updaters
-        if (frame % 12 === 0) {
-          const nextFuel = Math.max(0, fuelRef.current - 1.15);
-          fuelRef.current = nextFuel;
-          setFuel(Math.round(nextFuel));
-          if (nextFuel <= 0) {
-            lossReasonRef.current = 'fuel';
-            setLossReason('fuel');
-            phaseRef.current = 'lost';
-            setPhase('lost');
-            soundFx.playMove();
-          }
-        }
 
         if (frame % 22 === 0 && phaseRef.current === 'playing') {
           const nextDist = distanceRef.current + 10;
@@ -1293,22 +1291,8 @@ const CarRacingGame: React.FC<{
             phaseRef.current = 'won';
             setPhase('won');
             soundFx.playVictory();
-            onRewardRef.current(1200, `Race Victory at ${FINISH_DISTANCE}m (+1,200 Coins)`);
+            onRewardRef.current(2500, `Race Victory at ${FINISH_DISTANCE}m (+2,500 Winner / +500 Participant)`);
           }
-        }
-
-        fuelCan.y += 4.0;
-        if (fuelCan.y > H + 40) {
-          fuelCan.y = -110 - Math.random() * 80;
-          fuelCan.lane = Math.floor(Math.random() * 3);
-        }
-        const fx = LANES[fuelCan.lane];
-        if (Math.abs(fx - carX) < 26 && Math.abs(fuelCan.y - (H - 54)) < 36) {
-          fuelRef.current = Math.min(100, fuelRef.current + 26);
-          setFuel(Math.round(fuelRef.current));
-          fuelCan.y = -130;
-          fuelCan.lane = Math.floor(Math.random() * 3);
-          soundFx.playVictory();
         }
 
         for (const t of traffic) {
@@ -1319,8 +1303,6 @@ const CarRacingGame: React.FC<{
           }
           const tx = LANES[t.lane];
           if (Math.abs(tx - carX) < 28 && Math.abs(t.y - (H - 54)) < 44) {
-            lossReasonRef.current = 'crash';
-            setLossReason('crash');
             phaseRef.current = 'lost';
             setPhase('lost');
             soundFx.playMove();
@@ -1373,21 +1355,6 @@ const CarRacingGame: React.FC<{
         ctx.lineTo(228, y + 22);
         ctx.stroke();
       }
-
-      // Draw Fuel Jerrycan Pickup
-      const fcx = LANES[fuelCan.lane];
-      ctx.save();
-      ctx.shadowColor = '#10B981';
-      ctx.shadowBlur = 12;
-      ctx.fillStyle = '#10B981';
-      ctx.beginPath();
-      ctx.roundRect(fcx - 11, fuelCan.y - 13, 22, 26, 5);
-      ctx.fill();
-      ctx.fillStyle = '#022C22';
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('F', fcx, fuelCan.y + 4);
-      ctx.restore();
 
       for (const rv of rivals) {
         if (phaseRef.current === 'playing') {
@@ -1499,11 +1466,9 @@ const CarRacingGame: React.FC<{
         ))}
       </div>
 
-      <GameFuelGauge fuel={fuel} label={`Turbo Fuel · Distance ${distance}/${FINISH_DISTANCE}m`} />
-
       <div className="flex items-center justify-between text-xs">
         <span className="font-mono-tabular font-bold text-amber-300">
-          Lane {lane + 1} · Catch green Fuel Packs [F]
+          Lane {lane + 1} · Distance {distance}/{FINISH_DISTANCE}m
         </span>
         <button
           type="button"
@@ -1520,21 +1485,21 @@ const CarRacingGame: React.FC<{
         {phase === 'idle' && (
           <GameStartOverlay
             title="Sunset Cyber Sprint"
-            rule={`Race ${FINISH_DISTANCE}m to win! Dodge oncoming traffic and collect green Fuel Packs [F] to keep your tank full.`}
+            rule={`Race ${FINISH_DISTANCE}m to win! Dodge oncoming traffic across 3 turbo lanes.`}
             accentClass="bg-gradient-to-r from-cyan-400 to-teal-300"
+            realPlayerCount={players.length}
+            onInviteFriends={onInviteFriends}
             onStart={() => resetRace('playing')}
           />
         )}
         {(phase === 'won' || phase === 'lost') && (
           <GameOutcomeOverlay
             phase={phase}
-            headline={phase === 'won' ? 'FINISH LINE!' : lossReason === 'fuel' ? 'OUT OF FUEL!' : 'CRASHED!'}
+            headline={phase === 'won' ? 'FINISH LINE!' : 'CRASHED!'}
             detail={
               phase === 'won'
-                ? `You finished the ${FINISH_DISTANCE}m sprint with ${fuel}% fuel left! (+1,200 Bonus Coins)`
-                : lossReason === 'fuel'
-                  ? `Your tank ran dry at ${distance}m. Grab green Fuel Packs [F] next run!`
-                  : `Collision at ${distance}m against ${players.length - 1} squad rivals!`
+                ? `You finished the ${FINISH_DISTANCE}m sprint in 1st place! (+2,500 Winner / +500 Participant Coins)`
+                : `Collision at ${distance}m against ${players.length - 1} squad rivals!`
             }
             onRetry={() => resetRace('playing')}
           />
@@ -1564,213 +1529,647 @@ const CarRacingGame: React.FC<{
 };
 
 // ============================================================
-// 4. MULTIPLAYER TRUTH OR DARE (Aurora Neon Wheel + Fuel + Win/Loss)
+// 4. MULTIPLAYER LUDO KING (4-Color Classic Board + Safe Stars)
 // ============================================================
-const TRUTH_PROMPTS = [
-  'Who in this Voice Room makes you smile the fastest?',
-  'What is the biggest gift you want to receive tonight?',
-  'Share your most memorable late-night chat moment!',
-  'Which OG VELOCITY badge or frame is your absolute favorite?',
-];
-const DARE_PROMPTS = [
-  'Send a Rose (50 Coins) to anyone currently on a mic seat!',
-  'Drop a fire emote in the Voice Room chat right now!',
-  'Sing 1 line of your favorite song on live mic!',
-  'Give a shoutout to the Room Owner in chat!',
+type LudoColor = 'red' | 'green' | 'yellow' | 'blue';
+
+const LUDO_COLORS: LudoColor[] = ['red', 'green', 'yellow', 'blue'];
+
+const LUDO_PALETTE: Record<LudoColor, { name: string; fill: string; light: string }> = {
+  red: { name: 'Ruby Red', fill: '#EF4444', light: '#FCA5A5' },
+  green: { name: 'Emerald', fill: '#10B981', light: '#6EE7B7' },
+  yellow: { name: 'Sun Gold', fill: '#F59E0B', light: '#FDE68A' },
+  blue: { name: 'Sapphire', fill: '#3B82F6', light: '#93C5FD' },
+};
+
+const LUDO_TRACK: Array<[number, number]> = [
+  [6, 1], [6, 2], [6, 3], [6, 4], [6, 5],
+  [5, 6], [4, 6], [3, 6], [2, 6], [1, 6], [0, 6],
+  [0, 7], [0, 8],
+  [1, 8], [2, 8], [3, 8], [4, 8], [5, 8],
+  [6, 9], [6, 10], [6, 11], [6, 12], [6, 13], [6, 14],
+  [7, 14], [8, 14],
+  [8, 13], [8, 12], [8, 11], [8, 10], [8, 9],
+  [9, 8], [10, 8], [11, 8], [12, 8], [13, 8], [14, 8],
+  [14, 7], [14, 6],
+  [13, 6], [12, 6], [11, 6], [10, 6], [9, 6],
+  [8, 5], [8, 4], [8, 3], [8, 2], [8, 1], [8, 0],
+  [7, 0], [6, 0],
 ];
 
-const TruthOrDareGame: React.FC<{
+const LUDO_HOME_PATH: Record<LudoColor, Array<[number, number]>> = {
+  red: [[7, 1], [7, 2], [7, 3], [7, 4], [7, 5], [7, 6]],
+  green: [[1, 7], [2, 7], [3, 7], [4, 7], [5, 7], [6, 7]],
+  yellow: [[7, 13], [7, 12], [7, 11], [7, 10], [7, 9], [7, 8]],
+  blue: [[13, 7], [12, 7], [11, 7], [10, 7], [9, 7], [8, 7]],
+};
+
+const LUDO_YARD_COORDS: Record<LudoColor, Array<[number, number]>> = {
+  red: [[1.6, 1.6], [3.6, 1.6], [1.6, 3.6], [3.6, 3.6]],
+  green: [[1.6, 10.6], [3.6, 10.6], [1.6, 12.6], [3.6, 12.6]],
+  yellow: [[10.6, 10.6], [12.6, 10.6], [10.6, 12.6], [12.6, 12.6]],
+  blue: [[10.6, 1.6], [12.6, 1.6], [10.6, 3.6], [12.6, 3.6]],
+};
+
+const LUDO_START_OFFSETS: Record<LudoColor, number> = {
+  red: 0,
+  green: 13,
+  yellow: 26,
+  blue: 39,
+};
+
+const LUDO_SAFE_CELLS = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
+
+function ludoCellForToken(color: LudoColor, pos: number, tokenIdx: number): [number, number] {
+  if (pos < 0) return LUDO_YARD_COORDS[color][tokenIdx] ?? [2, 2];
+  if (pos <= 50) return LUDO_TRACK[(LUDO_START_OFFSETS[color] + pos) % 52];
+  return LUDO_HOME_PATH[color][Math.min(5, pos - 51)];
+}
+
+const LUDO_PIP_LAYOUTS: Record<number, Array<[number, number]>> = {
+  1: [[50, 50]],
+  2: [[28, 28], [72, 72]],
+  3: [[28, 28], [50, 50], [72, 72]],
+  4: [[28, 28], [72, 28], [28, 72], [72, 72]],
+  5: [[28, 28], [72, 28], [50, 50], [28, 72], [72, 72]],
+  6: [[28, 24], [72, 24], [28, 50], [72, 50], [28, 76], [72, 76]],
+};
+
+const LudoDiceSvg: React.FC<{ value: number; rolling: boolean; accentColor: string }> = ({
+  value,
+  rolling,
+  accentColor,
+}) => {
+  const pips = LUDO_PIP_LAYOUTS[Math.max(1, Math.min(6, value))] ?? LUDO_PIP_LAYOUTS[1];
+  return (
+    <div
+      className={`relative flex h-14 w-14 items-center justify-center rounded-2xl border-2 bg-gradient-to-br from-white via-slate-100 to-slate-300 shadow-[0_8px_22px_rgba(0,0,0,0.6),inset_0_2px_4px_rgba(255,255,255,0.9)] transition-transform duration-150 ${
+        rolling ? 'animate-spin scale-110' : 'hover:scale-105'
+      }`}
+      style={{ borderColor: accentColor, boxShadow: `0 0 18px ${accentColor}55, inset 0 2px 4px rgba(255,255,255,0.95)` }}
+    >
+      <svg viewBox="0 0 100 100" className="h-11 w-11">
+        {pips.map(([cx, cy], idx) => (
+          <circle
+            key={idx}
+            cx={cx}
+            cy={cy}
+            r={value === 1 ? 13 : 9.5}
+            fill={value === 1 || value === 6 ? '#E11D48' : '#0F172A'}
+          />
+        ))}
+      </svg>
+    </div>
+  );
+};
+
+const LudoGame: React.FC<{
   players: SquadPlayer[];
+  onInviteFriends?: () => void;
   onReward: (coins: number, msg: string) => void;
-}> = ({ players, onReward }) => {
+}> = ({ players, onInviteFriends, onReward }) => {
   const [phase, setPhase] = useState<GamePhase>('idle');
-  const [fuel, setFuel] = useState(100);
-  const [partyPoints, setPartyPoints] = useState(0);
-  const [angle, setAngle] = useState(0);
-  const [spinning, setSpinning] = useState(false);
   const [turnIdx, setTurnIdx] = useState(0);
-  const [result, setResult] = useState<{
-    playerName: string;
-    kind: 'TRUTH' | 'DARE';
-    text: string;
-  } | null>(null);
+  const [dice, setDice] = useState<number | null>(null);
+  const [displayDice, setDisplayDice] = useState<number>(6);
+  const [isRolling, setIsRolling] = useState(false);
+  const [isStepping, setIsStepping] = useState(false);
+  const [consecutiveSixes, setConsecutiveSixes] = useState(0);
+  const [mustRoll, setMustRoll] = useState(true);
+  const [tokensByPlayer, setTokensByPlayer] = useState<number[][]>(() =>
+    players.map(() => [-1, -1, -1, -1])
+  );
+  const [winnerName, setWinnerName] = useState<string>('');
+  const [statusLog, setStatusLog] = useState<string>('Roll the 3D dice to deploy a token!');
 
-  const TARGET_POINTS = 300;
-  const activePlayer = players[turnIdx % players.length];
+  const activeCount = Math.max(2, Math.min(4, players.length));
+  const safeTurnIdx = turnIdx % activeCount;
+  const activePlayer = players[safeTurnIdx] ?? players[0];
+  const activeColor = LUDO_COLORS[safeTurnIdx % 4];
 
-  const resetTruthDare = (nextPhase: GamePhase) => {
-    setFuel(100);
-    setPartyPoints(0);
-    setResult(null);
-    setSpinning(false);
+  const resetLudo = (nextPhase: GamePhase) => {
+    setTokensByPlayer(Array.from({ length: activeCount }, () => [-1, -1, -1, -1]));
     setTurnIdx(0);
+    setDice(null);
+    setDisplayDice(6);
+    setIsRolling(false);
+    setIsStepping(false);
+    setConsecutiveSixes(0);
+    setMustRoll(true);
+    setWinnerName('');
+    setStatusLog(`${players[0]?.name || 'Player 1'}'s turn — Tap Roll Dice!`);
     setPhase(nextPhase);
   };
 
-  const spinWheel = () => {
-    if (spinning || phase !== 'playing') return;
-    setSpinning(true);
+  const handleRollDice = () => {
+    if (phase !== 'playing' || !mustRoll || isRolling || isStepping) return;
+    setIsRolling(true);
     soundFx.playMove();
-    const extra = 720 + Math.floor(Math.random() * 720);
-    const nextAngle = angle + extra;
-    setAngle(nextAngle);
 
-    window.setTimeout(() => {
-      const normalized = nextAngle % 360;
-      const isTruth = Math.floor(normalized / 60) % 2 === 0;
-      const pool = isTruth ? TRUTH_PROMPTS : DARE_PROMPTS;
-      const text = pool[Math.floor(Math.random() * pool.length)];
-      const nextFuel = Math.max(0, fuel - 25);
-      setFuel(nextFuel);
-      setResult({
-        playerName: activePlayer?.name || 'Player',
-        kind: isTruth ? 'TRUTH' : 'DARE',
-        text,
-      });
-      setSpinning(false);
-      onReward(150, `${activePlayer?.name} spun Truth or Dare (+150 Coins)`);
-      soundFx.playVictory();
-    }, 950);
+    let ticks = 0;
+    const rollAnim = window.setInterval(() => {
+      ticks += 1;
+      setDisplayDice(1 + Math.floor(Math.random() * 6));
+      if (ticks >= 7) {
+        window.clearInterval(rollAnim);
+        const rolled = 1 + Math.floor(Math.random() * 6);
+        setDisplayDice(rolled);
+        setIsRolling(false);
+
+        const nextSixStreak = rolled === 6 ? consecutiveSixes + 1 : 0;
+        if (nextSixStreak >= 3) {
+          const nextTurn = (safeTurnIdx + 1) % activeCount;
+          setConsecutiveSixes(0);
+          setDice(null);
+          setMustRoll(true);
+          setTurnIdx(nextTurn);
+          setStatusLog(
+            `${activePlayer?.name || 'Player'} rolled three 6s in a row — turn forfeited! ${players[nextTurn]?.name || 'Next'}'s turn.`
+          );
+          return;
+        }
+
+        setConsecutiveSixes(nextSixStreak);
+        setDice(rolled);
+        const myTokens = tokensByPlayer[safeTurnIdx] || [-1, -1, -1, -1];
+        const hasLegal = myTokens.some((pos) => (pos === -1 ? rolled === 6 : pos + rolled <= 56));
+        if (!hasLegal) {
+          const nextTurn = (safeTurnIdx + 1) % activeCount;
+          setConsecutiveSixes(0);
+          setDice(null);
+          setMustRoll(true);
+          setTurnIdx(nextTurn);
+          setStatusLog(
+            `${activePlayer?.name || 'Player'} rolled ${rolled} (no legal move). ${players[nextTurn]?.name || 'Next'}'s turn.`
+          );
+          return;
+        }
+        setMustRoll(false);
+        setStatusLog(`${activePlayer?.name || 'Player'} rolled ${rolled}! Select a glowing token.`);
+      }
+    }, 55);
   };
 
-  const resolveTurn = (completed: boolean) => {
-    if (phase !== 'playing') return;
-    if (completed) {
-      const nextPts = partyPoints + 100;
-      const nextFuel = Math.min(100, fuel + 12);
-      setPartyPoints(nextPts);
-      setFuel(nextFuel);
-      setResult(null);
-      setTurnIdx((t) => (t + 1) % players.length);
-      if (nextPts >= TARGET_POINTS) {
-        setPhase('won');
-        onReward(600, `Truth or Dare Party Victory (+600 Coins)`);
-        soundFx.playVictory();
+  const finalizeTokenMove = (nextAll: number[][], nextPos: number, rolledValue: number) => {
+    let capturedOpponent: string | null = null;
+    if (nextPos >= 0 && nextPos <= 50) {
+      const globalSq = (LUDO_START_OFFSETS[activeColor] + nextPos) % 52;
+      if (!LUDO_SAFE_CELLS.has(globalSq)) {
+        for (let p = 0; p < activeCount; p++) {
+          if (p === safeTurnIdx) continue;
+          const oppColor = LUDO_COLORS[p % 4];
+          nextAll[p].forEach((opPos, opIdx) => {
+            if (opPos >= 0 && opPos <= 50 && (LUDO_START_OFFSETS[oppColor] + opPos) % 52 === globalSq) {
+              nextAll[p][opIdx] = -1;
+              capturedOpponent = players[p]?.name || 'Opponent';
+            }
+          });
+        }
       }
+    }
+
+    setTokensByPlayer(nextAll);
+    setDice(null);
+    setMustRoll(true);
+    setIsStepping(false);
+
+    const finished = nextAll[safeTurnIdx].filter((p) => p === 56).length;
+    if (finished === 4) {
+      const winName = activePlayer?.name || 'Player';
+      setWinnerName(winName);
+      setPhase('won');
+      setStatusLog(`${winName} brought all 4 tokens Home!`);
+      onReward(2500, `${winName} won Ludo King (+2,500 Winner / +500 Participant Coins)`);
+      soundFx.playVictory();
+      return;
+    }
+
+    if (rolledValue === 6 || capturedOpponent || nextPos === 56) {
+      setStatusLog(
+        capturedOpponent
+          ? `${activePlayer?.name} captured ${capturedOpponent}! Bonus roll!`
+          : nextPos === 56
+            ? `${activePlayer?.name} reached Home! Bonus roll!`
+            : `${activePlayer?.name} rolled 6! Bonus roll!`
+      );
+      if (capturedOpponent || nextPos === 56) soundFx.playVictory();
     } else {
-      const nextFuel = Math.max(0, fuel - 25);
-      setFuel(nextFuel);
-      setResult(null);
-      setTurnIdx((t) => (t + 1) % players.length);
-      if (nextFuel <= 0) {
-        setPhase('lost');
-        soundFx.playMove();
-      }
+      const nextTurn = (safeTurnIdx + 1) % activeCount;
+      setConsecutiveSixes(0);
+      setTurnIdx(nextTurn);
+      setStatusLog(`${activePlayer?.name} moved ${rolledValue}. ${players[nextTurn]?.name || 'Next'}'s turn.`);
     }
   };
 
+  const handleMoveToken = (tokenIdx: number) => {
+    if (phase !== 'playing' || mustRoll || dice === null || isRolling || isStepping) return;
+    const myTokens = [...(tokensByPlayer[safeTurnIdx] || [-1, -1, -1, -1])];
+    const curPos = myTokens[tokenIdx];
+    const rolledValue = dice;
+    if (curPos === -1 && rolledValue !== 6) return;
+    if (curPos >= 0 && curPos + rolledValue > 56) return;
+
+    const targetPos = curPos === -1 ? 0 : curPos + rolledValue;
+    if (curPos === -1) {
+      const nextAll = tokensByPlayer.map((arr) => [...arr]);
+      nextAll[safeTurnIdx][tokenIdx] = 0;
+      soundFx.playMove();
+      finalizeTokenMove(nextAll, 0, rolledValue);
+      return;
+    }
+
+    // Stepped hop transition along the path
+    setIsStepping(true);
+    let stepPos = curPos;
+    const hopTimer = window.setInterval(() => {
+      stepPos += 1;
+      soundFx.playMove();
+      const stepAll = tokensByPlayer.map((arr) => [...arr]);
+      stepAll[safeTurnIdx][tokenIdx] = stepPos;
+      setTokensByPlayer(stepAll);
+      if (stepPos >= targetPos) {
+        window.clearInterval(hopTimer);
+        finalizeTokenMove(stepAll, targetPos, rolledValue);
+      }
+    }, 95);
+  };
+
+  // Precompute per-square token stacking offsets so shared squares stay crystal clear
+  const tokenRenderEntries = useMemo(() => {
+    const groups = new Map<string, Array<{ pIdx: number; tIdx: number; pos: number; r: number; c: number; clr: LudoColor }>>();
+    for (let pIdx = 0; pIdx < activeCount; pIdx++) {
+      const clr = LUDO_COLORS[pIdx % 4];
+      const pTokens = tokensByPlayer[pIdx] || [-1, -1, -1, -1];
+      pTokens.forEach((pos, tIdx) => {
+        const [r, c] = ludoCellForToken(clr, pos, tIdx);
+        const key = pos < 0 ? `yard-${pIdx}-${tIdx}` : `${r.toFixed(1)},${c.toFixed(1)}`;
+        const arr = groups.get(key) ?? [];
+        arr.push({ pIdx, tIdx, pos, r, c, clr });
+        groups.set(key, arr);
+      });
+    }
+    const entries: Array<{
+      pIdx: number;
+      tIdx: number;
+      pos: number;
+      cx: number;
+      cy: number;
+      clr: LudoColor;
+      scale: number;
+    }> = [];
+    for (const list of groups.values()) {
+      const n = list.length;
+      const scale = n === 1 ? 1 : n === 2 ? 0.82 : 0.72;
+      list.forEach((item, idx) => {
+        const angle = n === 1 ? 0 : (idx / n) * Math.PI * 2;
+        const spread = n === 1 ? 0 : n === 2 ? 4.2 : 5.2;
+        entries.push({
+          pIdx: item.pIdx,
+          tIdx: item.tIdx,
+          pos: item.pos,
+          clr: item.clr,
+          cx: item.c * 24 + 12 + Math.cos(angle) * spread,
+          cy: item.r * 24 + 12 + Math.sin(angle) * spread,
+          scale,
+        });
+      });
+    }
+    return entries;
+  }, [activeCount, tokensByPlayer]);
+
   return (
-    <div className="relative flex flex-col items-center gap-3.5 py-1 text-center">
-      <div className="w-full">
-        <GameFuelGauge fuel={fuel} label={`Party Fuel · Points ${partyPoints}/${TARGET_POINTS}`} />
+    <div className="relative flex flex-col items-center gap-3 py-1">
+      <div className="flex w-full items-center justify-between rounded-2xl border border-amber-400/25 bg-[#070B14]/90 px-3.5 py-2 text-xs font-bold shadow-lg">
+        <div className="flex items-center gap-2">
+          <span
+            className="h-3 w-3 rounded-full shadow-[0_0_8px_currentColor]"
+            style={{ backgroundColor: LUDO_PALETTE[activeColor].fill, color: LUDO_PALETTE[activeColor].fill }}
+          />
+          <span className="text-amber-300">
+            {activePlayer?.name || 'Player'} ({LUDO_PALETTE[activeColor].name})
+          </span>
+        </div>
+        <span className="text-cyan-300">
+          {isRolling ? 'Rolling...' : isStepping ? 'Advancing...' : dice ? `Rolled: ${dice}` : 'Ready to Roll'}
+        </span>
       </div>
 
-      {/* Player Turn Ring */}
-      <div className="flex flex-wrap items-center justify-center gap-2">
-        {players.map((pl, idx) => {
-          const isCurrent = idx === turnIdx % players.length;
+      {/* Turn Ring */}
+      <div className="flex flex-wrap items-center justify-center gap-1.5">
+        {players.slice(0, activeCount).map((pl, idx) => {
+          const clr = LUDO_COLORS[idx % 4];
+          const isCurrent = idx === safeTurnIdx;
+          const homeCount = (tokensByPlayer[idx] || []).filter((p) => p === 56).length;
           return (
             <div
               key={pl.id}
-              className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${
+              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-bold transition-all ${
                 isCurrent
-                  ? 'border-rose-400 bg-rose-500/20 text-white shadow-[0_0_12px_rgba(244,63,94,0.4)]'
+                  ? 'scale-105 border-amber-400 bg-amber-500/20 text-white shadow-[0_0_14px_rgba(245,158,11,0.4)]'
                   : 'border-white/10 bg-[#070B14] text-slate-400'
               }`}
             >
-              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: pl.color }} />
+              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: LUDO_PALETTE[clr].fill }} />
               <span>{pl.name}</span>
-              {isCurrent && <span className="text-[10px] text-rose-300">(Turn)</span>}
+              <span className="font-mono text-[10px] text-slate-300">{homeCount}/4</span>
             </div>
           );
         })}
       </div>
 
-      <div className="relative flex items-center justify-center py-2">
-        <div className="absolute -top-1 z-10 h-0 w-0 border-x-[10px] border-t-[16px] border-x-transparent border-t-amber-300 drop-shadow-[0_0_8px_rgba(251,191,36,0.9)]" />
-        <div
-          onClick={spinWheel}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') spinWheel();
-          }}
-          style={{
-            transform: `rotate(${angle}deg)`,
-            transition: 'transform 0.95s cubic-bezier(0.15, 0.85, 0.25, 1)',
-            background:
-              'conic-gradient(#0EA5E9 0deg 60deg, #EC4899 60deg 120deg, #10B981 120deg 180deg, #F59E0B 180deg 240deg, #8B5CF6 240deg 300deg, #F43F5E 300deg 360deg)',
-          }}
-          className="relative flex h-48 w-48 cursor-pointer items-center justify-center rounded-full border-4 border-cyan-300 shadow-[0_0_40px_rgba(34,211,238,0.4)]"
+      {/* High-Definition 4K Vector Ludo Arena Board */}
+      <div className="relative rounded-[28px] border-4 border-amber-400/80 bg-gradient-to-br from-[#78350F] via-[#1E1B4B] to-[#451A03] p-2 shadow-[0_22px_55px_rgba(0,0,0,0.88),0_0_38px_rgba(245,158,11,0.3)] ring-1 ring-amber-200/35">
+        <div className="pointer-events-none absolute inset-1.5 rounded-[20px] border border-amber-300/30" />
+        <svg
+          viewBox="0 0 360 360"
+          className="h-72 w-72 rounded-2xl bg-[#F8FAFC] shadow-[inset_0_2px_10px_rgba(15,23,42,0.35)] sm:h-84 sm:w-84"
         >
-          <div className="pointer-events-none absolute inset-0 rounded-full bg-[radial-gradient(circle_at_30%_25%,rgba(255,255,255,0.28),transparent_55%)]" />
-          <div className="relative flex h-16 w-16 items-center justify-center rounded-full border-2 border-cyan-300 bg-gradient-to-b from-[#132038] to-[#070B14] text-xs font-extrabold tracking-widest text-cyan-200 shadow-lg">
-            SPIN
-          </div>
-        </div>
+          <defs>
+            <linearGradient id="ludoRedGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stopColor="#F87171" />
+              <stop offset="55%" stopColor="#EF4444" />
+              <stop offset="100%" stopColor="#991B1B" />
+            </linearGradient>
+            <linearGradient id="ludoGreenGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stopColor="#34D399" />
+              <stop offset="55%" stopColor="#10B981" />
+              <stop offset="100%" stopColor="#047857" />
+            </linearGradient>
+            <linearGradient id="ludoYellowGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stopColor="#FCD34D" />
+              <stop offset="55%" stopColor="#F59E0B" />
+              <stop offset="100%" stopColor="#B45309" />
+            </linearGradient>
+            <linearGradient id="ludoBlueGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stopColor="#60A5FA" />
+              <stop offset="55%" stopColor="#3B82F6" />
+              <stop offset="100%" stopColor="#1D4ED8" />
+            </linearGradient>
+            <linearGradient id="ludoBoardTile" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#FFFFFF" />
+              <stop offset="100%" stopColor="#E2E8F0" />
+            </linearGradient>
+            <radialGradient id="ludoSafeStar" cx="50%" cy="40%" r="60%">
+              <stop offset="0%" stopColor="#334155" />
+              <stop offset="100%" stopColor="#0F172A" />
+            </radialGradient>
+            <filter id="ludoTokenShadow" x="-30%" y="-30%" width="160%" height="160%">
+              <feDropShadow dx="0" dy="2" stdDeviation="1.6" floodColor="#000000" floodOpacity="0.6" />
+            </filter>
+          </defs>
+
+          {/* 4 Glossy Corner Yards */}
+          <rect x={0} y={0} width={144} height={144} fill="url(#ludoRedGrad)" />
+          <rect x={18} y={18} width={108} height={108} rx={18} fill="#FFF1F2" stroke="#FCA5A5" strokeWidth={2.5} />
+          <rect x={216} y={0} width={144} height={144} fill="url(#ludoGreenGrad)" />
+          <rect x={234} y={18} width={108} height={108} rx={18} fill="#ECFDF5" stroke="#6EE7B7" strokeWidth={2.5} />
+          <rect x={216} y={216} width={144} height={144} fill="url(#ludoYellowGrad)" />
+          <rect x={234} y={234} width={108} height={108} rx={18} fill="#FFFBEB" stroke="#FDE68A" strokeWidth={2.5} />
+          <rect x={0} y={216} width={144} height={144} fill="url(#ludoBlueGrad)" />
+          <rect x={18} y={234} width={108} height={108} rx={18} fill="#EFF6FF" stroke="#93C5FD" strokeWidth={2.5} />
+
+          {/* 52 Main Track Squares */}
+          {LUDO_TRACK.map(([r, c], idx) => {
+            const isSafe = LUDO_SAFE_CELLS.has(idx);
+            const startFill =
+              idx === 0
+                ? 'url(#ludoRedGrad)'
+                : idx === 13
+                  ? 'url(#ludoGreenGrad)'
+                  : idx === 26
+                    ? 'url(#ludoYellowGrad)'
+                    : idx === 39
+                      ? 'url(#ludoBlueGrad)'
+                      : null;
+            return (
+              <g key={`lt-${idx}`}>
+                <rect
+                  x={c * 24}
+                  y={r * 24}
+                  width={24}
+                  height={24}
+                  fill={startFill ?? (isSafe ? 'url(#ludoSafeStar)' : 'url(#ludoBoardTile)')}
+                  stroke="#94A3B8"
+                  strokeWidth={0.85}
+                />
+                {isSafe && (
+                  <text
+                    x={c * 24 + 12}
+                    y={r * 24 + 16}
+                    textAnchor="middle"
+                    fontSize={12.5}
+                    fill={startFill ? '#FFFFFF' : '#FBBF24'}
+                  >
+                    ★
+                  </text>
+                )}
+              </g>
+            );
+          })}
+
+          {/* Colored Home Stretch Lanes */}
+          {LUDO_COLORS.map((clr) =>
+            LUDO_HOME_PATH[clr].slice(0, 5).map(([r, c], i) => {
+              const grad =
+                clr === 'red'
+                  ? 'url(#ludoRedGrad)'
+                  : clr === 'green'
+                    ? 'url(#ludoGreenGrad)'
+                    : clr === 'yellow'
+                      ? 'url(#ludoYellowGrad)'
+                      : 'url(#ludoBlueGrad)';
+              return (
+                <rect
+                  key={`lhs-${clr}-${i}`}
+                  x={c * 24}
+                  y={r * 24}
+                  width={24}
+                  height={24}
+                  fill={grad}
+                  stroke="#FFFFFF"
+                  strokeOpacity={0.6}
+                  strokeWidth={0.9}
+                />
+              );
+            })
+          )}
+
+          {/* Home Center Prism */}
+          <polygon points="144,144 180,180 144,216" fill="url(#ludoRedGrad)" stroke="#FFFFFF" strokeWidth={1} />
+          <polygon points="144,144 216,144 180,180" fill="url(#ludoGreenGrad)" stroke="#FFFFFF" strokeWidth={1} />
+          <polygon points="216,144 216,216 180,180" fill="url(#ludoYellowGrad)" stroke="#FFFFFF" strokeWidth={1} />
+          <polygon points="144,216 216,216 180,180" fill="url(#ludoBlueGrad)" stroke="#FFFFFF" strokeWidth={1} />
+          <circle cx={180} cy={180} r={14} fill="#0F172A" stroke="#FDE047" strokeWidth={2} />
+          <text x={180} y={185} textAnchor="middle" fontSize={13}>
+            👑
+          </text>
+
+          {/* Yard Base Circles */}
+          {LUDO_COLORS.map((clr) =>
+            LUDO_YARD_COORDS[clr].map(([r, c], idx) => (
+              <g key={`ly-${clr}-${idx}`}>
+                <circle
+                  cx={c * 24 + 12}
+                  cy={r * 24 + 12}
+                  r={11.5}
+                  fill={LUDO_PALETTE[clr].fill}
+                  fillOpacity={0.2}
+                  stroke={LUDO_PALETTE[clr].fill}
+                  strokeWidth={1.8}
+                />
+                <circle
+                  cx={c * 24 + 12}
+                  cy={r * 24 + 12}
+                  r={6}
+                  fill="#FFFFFF"
+                  fillOpacity={0.65}
+                />
+              </g>
+            ))
+          )}
+
+          {/* 3D Glossy Tokens with Multi-Token Stacking */}
+          {tokenRenderEntries.map(({ pIdx, tIdx, pos, cx, cy, clr, scale }) => {
+            const isTurnOwner =
+              pIdx === safeTurnIdx && !mustRoll && dice !== null && phase === 'playing' && !isStepping;
+            const isLegal = isTurnOwner && (pos === -1 ? dice === 6 : pos + (dice ?? 0) <= 56);
+            const rOuter = 8.5 * scale;
+            const rInner = 5.5 * scale;
+            return (
+              <g
+                key={`ltok-${pIdx}-${tIdx}`}
+                onClick={() => isLegal && handleMoveToken(tIdx)}
+                style={{ cursor: isLegal ? 'pointer' : 'default' }}
+                filter="url(#ludoTokenShadow)"
+              >
+                {isLegal && (
+                  <circle
+                    cx={cx}
+                    cy={cy}
+                    r={rOuter + 3.5}
+                    fill="none"
+                    stroke="#FDE047"
+                    strokeWidth={2.2}
+                    strokeDasharray="3.5 2"
+                  >
+                    <animateTransform
+                      attributeName="transform"
+                      type="rotate"
+                      from={`0 ${cx} ${cy}`}
+                      to={`360 ${cx} ${cy}`}
+                      dur="2s"
+                      repeatCount="indefinite"
+                    />
+                  </circle>
+                )}
+                <circle
+                  cx={cx}
+                  cy={cy}
+                  r={rOuter}
+                  fill={LUDO_PALETTE[clr].fill}
+                  stroke="#FFFFFF"
+                  strokeWidth={2}
+                />
+                <circle
+                  cx={cx}
+                  cy={cy - 1 * scale}
+                  r={rInner}
+                  fill={LUDO_PALETTE[clr].light}
+                  fillOpacity={0.45}
+                />
+                <circle
+                  cx={cx - 2.3 * scale}
+                  cy={cy - 2.5 * scale}
+                  r={1.7 * scale}
+                  fill="#FFFFFF"
+                  fillOpacity={0.85}
+                />
+                <text
+                  x={cx}
+                  y={cy + 2.8 * scale}
+                  textAnchor="middle"
+                  fontSize={7.8 * scale}
+                  fontWeight="900"
+                  fill="#FFFFFF"
+                >
+                  {tIdx + 1}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
       </div>
 
-      {!result ? (
+      {/* 3D Animated Dice & Status Strip */}
+      <div className="flex w-full max-w-md flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-400/25 bg-gradient-to-r from-[#0B1224]/95 via-[#131C35]/95 to-[#0B1224]/95 px-4 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.65)]">
+        <div className="flex items-center gap-3">
+          <div className="rounded-xl border border-white/15 bg-black/40 p-1 shadow-inner">
+            <LudoDiceSvg
+              value={dice ?? displayDice}
+              rolling={isRolling}
+              accentColor={LUDO_PALETTE[activeColor].fill}
+            />
+          </div>
+          <div className="max-w-[185px] text-left text-[11px] leading-snug font-semibold text-slate-100">
+            {statusLog}
+            {consecutiveSixes > 0 && (
+              <div className="mt-0.5 text-[10px] font-bold text-amber-300">
+                6-Streak: {consecutiveSixes}/3
+              </div>
+            )}
+          </div>
+        </div>
         <button
           type="button"
-          disabled={spinning || phase !== 'playing'}
-          onClick={spinWheel}
-          className="rounded-full bg-gradient-to-r from-cyan-500 to-teal-400 px-6 py-2.5 text-xs font-bold text-slate-950 shadow-lg disabled:opacity-50"
+          disabled={phase !== 'playing' || !mustRoll || isRolling || isStepping}
+          onClick={handleRollDice}
+          className="inline-flex items-center gap-1.5 rounded-2xl border border-amber-200/60 bg-gradient-to-r from-amber-400 via-orange-400 to-rose-500 px-5 py-2.5 text-xs font-black text-slate-950 shadow-[0_6px_18px_rgba(245,158,11,0.4)] transition hover:scale-[1.02] hover:brightness-110 disabled:opacity-40"
         >
-          {spinning ? 'Spinning...' : `Spin for ${activePlayer?.name} (+150 Coins)`}
+          <Dices className="h-4 w-4" />
+          <span>{isRolling ? 'Rolling...' : 'Roll Dice'}</span>
         </button>
-      ) : (
-        <div className="w-full max-w-md space-y-2.5 rounded-2xl border border-amber-400/35 bg-[#132038] p-4">
-          <div className="flex items-center justify-center gap-2">
-            <span className="text-xs font-bold text-amber-300">{result.playerName}</span>
-            <span
-              className={`inline-block rounded-full px-3 py-0.5 text-[10px] font-extrabold ${
-                result.kind === 'TRUTH'
-                  ? 'bg-cyan-500/25 text-cyan-200'
-                  : 'bg-rose-500/25 text-rose-200'
-              }`}
-            >
-              {result.kind}
-            </span>
-          </div>
-          <p className="text-sm font-semibold text-white">{result.text}</p>
-          <div className="flex items-center justify-center gap-2 pt-1">
-            <button
-              type="button"
-              onClick={() => resolveTurn(true)}
-              className="rounded-xl bg-emerald-500 px-4 py-1.5 text-xs font-extrabold text-slate-950 hover:bg-emerald-400"
-            >
-              Complete (+100 pts, +12% Fuel)
-            </button>
-            <button
-              type="button"
-              onClick={() => resolveTurn(false)}
-              className="rounded-xl border border-rose-400/40 bg-rose-500/20 px-4 py-1.5 text-xs font-bold text-rose-200 hover:bg-rose-500/30"
-            >
-              Skip (-25% Fuel)
-            </button>
-          </div>
+      </div>
+
+      {/* Quick Token Selector Row */}
+      {phase === 'playing' && !mustRoll && dice !== null && !isStepping && (
+        <div className="flex flex-wrap items-center justify-center gap-1.5">
+          {(tokensByPlayer[safeTurnIdx] || [-1, -1, -1, -1]).map((pos, idx) => {
+            const legal = pos === -1 ? dice === 6 : pos + dice <= 56;
+            return (
+              <button
+                key={idx}
+                type="button"
+                disabled={!legal}
+                onClick={() => handleMoveToken(idx)}
+                className={`rounded-xl px-3 py-1.5 text-[11px] font-bold transition ${
+                  legal
+                    ? 'bg-emerald-500 text-slate-950 shadow hover:bg-emerald-400'
+                    : 'border border-white/10 bg-white/5 text-slate-500'
+                }`}
+              >
+                Token #{idx + 1} ({pos < 0 ? 'Yard' : pos === 56 ? 'Home' : `Sq ${pos}`})
+              </button>
+            );
+          })}
         </div>
       )}
 
       {phase === 'idle' && (
         <GameStartOverlay
-          title="Aurora Truth or Dare"
-          rule={`Reach ${TARGET_POINTS} Party Points by completing Truths & Dares before your Party Fuel hits 0%!`}
-          accentClass="bg-gradient-to-r from-rose-400 to-pink-400"
-          onStart={() => resetTruthDare('playing')}
+          title="Ludo King 4K Arena"
+          rule="Roll 6 to deploy tokens, hop along the 52-tile track, shelter on ★ Safe Stars, capture rivals, and bring all 4 tokens Home first!"
+          accentClass="bg-gradient-to-r from-amber-400 to-emerald-400"
+          realPlayerCount={players.length}
+          onInviteFriends={onInviteFriends}
+          onStart={() => resetLudo('playing')}
         />
       )}
       {(phase === 'won' || phase === 'lost') && (
         <GameOutcomeOverlay
           phase={phase}
-          headline={phase === 'won' ? 'PARTY CROWN!' : 'GAME OVER'}
-          detail={
-            phase === 'won'
-              ? `Squad reached ${partyPoints} Party Points with ${fuel}% fuel remaining! (+600 Bonus Coins)`
-              : `Party Fuel ran dry at ${partyPoints}/${TARGET_POINTS} points.`
-          }
-          onRetry={() => resetTruthDare('playing')}
+          headline="LUDO CHAMPION!"
+          detail={`${winnerName || activePlayer?.name} reached Home with all 4 tokens! (+2,500 Winner / +500 Participant Coins)`}
+          onRetry={() => resetLudo('playing')}
         />
       )}
     </div>
@@ -1784,6 +2183,11 @@ const GameCoverArtwork: React.FC<{ gameId: GameId; isHero?: boolean }> = ({
   gameId,
 }) => {
   const coverMap: Record<GameId, { img: string; alt: string; gradient: string }> = {
+    ludo: {
+      img: ludoCoverImg,
+      alt: 'Ludo King 4K Cover',
+      gradient: 'linear-gradient(145deg, #1E1B4B 0%, #0F766E 55%, #090D1F 100%)',
+    },
     carrom: {
       img: carromCoverImg,
       alt: 'Carrom Board Cover',
@@ -1798,11 +2202,6 @@ const GameCoverArtwork: React.FC<{ gameId: GameId; isHero?: boolean }> = ({
       img: racingCoverImg,
       alt: 'Car Racing Cover',
       gradient: 'linear-gradient(145deg, #2E1065 0%, #EC4899 55%, #090D1F 100%)',
-    },
-    'truth-dare': {
-      img: truthDareCoverImg,
-      alt: 'Truth or Dare Cover',
-      gradient: 'linear-gradient(145deg, #4C0519 0%, #BE185D 55%, #140B24 100%)',
     },
   };
 
@@ -1827,6 +2226,8 @@ const GameCoverArtwork: React.FC<{ gameId: GameId; isHero?: boolean }> = ({
 // ============================================================
 export const GamesSection: React.FC<GamesSectionProps> = ({
   friends = [],
+  currentUserUid,
+  currentUserName = USER_PROFILE.name,
   onInviteFriend,
   onEarnCoins,
 }) => {
@@ -1837,7 +2238,12 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [invitedFriendUids, setInvitedFriendUids] = useState<string[]>([]);
   const [lastRewardMsg, setLastRewardMsg] = useState<string | null>(null);
+  const [gameVoiceJoined, setGameVoiceJoined] = useState(false);
+  const [gameVoiceMuted, setGameVoiceMuted] = useState(false);
+  const [gameSpeakerMuted, setGameSpeakerMuted] = useState(false);
+  const [gameVoicePeers, setGameVoicePeers] = useState<GameVoicePeer[]>([]);
 
+  // Strictly real players only (zero AI bots)
   const squadPlayers: SquadPlayer[] = useMemo(() => {
     const invitedRecords = friends.filter((f) => invitedFriendUids.includes(f.uid));
     const others: SquadPlayer[] = [];
@@ -1848,26 +2254,69 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
         id: fr.uid,
         name: fr.name,
         color: SQUAD_COLORS[(others.length + 1) % SQUAD_COLORS.length],
-        isBot: false,
-      });
-    }
-
-    for (const av of AVATAR_ROSTER) {
-      if (others.length >= playerCount - 1) break;
-      if (others.some((o) => o.id === av.uid)) continue;
-      others.push({
-        id: av.uid,
-        name: av.name,
-        color: SQUAD_COLORS[(others.length + 1) % SQUAD_COLORS.length],
-        isBot: true,
       });
     }
 
     return [
-      { id: USER_PROFILE.uid, name: USER_PROFILE.name, color: SQUAD_COLORS[0] },
+      { id: currentUserUid || USER_PROFILE.uid, name: currentUserName || USER_PROFILE.name, color: SQUAD_COLORS[0] },
       ...others,
     ];
-  }, [friends, invitedFriendUids, playerCount]);
+  }, [friends, invitedFriendUids, playerCount, currentUserUid, currentUserName]);
+
+  const matchVoiceId = useMemo(() => {
+    if (!activeGame) return '';
+    const ids = squadPlayers.map((p) => p.id).filter(Boolean).sort();
+    return `ogv-game-${activeGame}-${ids.join('-')}`;
+  }, [activeGame, squadPlayers]);
+
+  useEffect(() => {
+    const unsub = ogRealtime.subscribe((msg) => {
+      if (msg.type === 'game:voice-peers' && String(msg.matchId || '') === matchVoiceId) {
+        const peers = Array.isArray(msg.peers) ? (msg.peers as GameVoicePeer[]) : [];
+        setGameVoicePeers(peers);
+      }
+    });
+    return unsub;
+  }, [matchVoiceId]);
+
+  useEffect(() => {
+    if (!activeGame && gameVoiceJoined) {
+      ogRealtime.leaveGameVoice();
+      setGameVoiceJoined(false);
+      setGameVoiceMuted(false);
+      setGameVoicePeers([]);
+    }
+  }, [activeGame, gameVoiceJoined]);
+
+  const handleToggleGameVoice = async () => {
+    if (!matchVoiceId) return;
+    if (gameVoiceJoined) {
+      ogRealtime.leaveGameVoice(matchVoiceId);
+      setGameVoiceJoined(false);
+      setGameVoicePeers([]);
+    } else {
+      const ok = await ogRealtime.joinGameVoice(matchVoiceId);
+      if (ok) {
+        setGameVoiceJoined(true);
+        setGameVoiceMuted(false);
+      } else {
+        setLastRewardMsg('Microphone permission required for live in-game voice chat.');
+      }
+    }
+  };
+
+  const handleToggleGameMic = () => {
+    if (!matchVoiceId || !gameVoiceJoined) return;
+    const next = !gameVoiceMuted;
+    setGameVoiceMuted(next);
+    ogRealtime.setGameMicMuted(matchVoiceId, next);
+  };
+
+  const handleToggleGameSpeaker = () => {
+    const next = !gameSpeakerMuted;
+    setGameSpeakerMuted(next);
+    ogRealtime.setSpeakerMuted(next);
+  };
 
   const handleReward = (coins: number, msg: string) => {
     onEarnCoins(coins, msg);
@@ -1896,10 +2345,11 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
       icon: <Car className="h-5 w-5 text-sky-200" />,
     },
     {
-      id: 'truth-dare',
-      title: 'Truth or Dare',
-      subtitle: 'Aurora Wheel · 2–4P',
-      icon: <Flame className="h-5 w-5 text-pink-200" />,
+      id: 'ludo',
+      title: 'Ludo King',
+      subtitle: '4-Color Race · 2–4P',
+      tag: 'CLASSIC',
+      icon: <Dices className="h-5 w-5 text-amber-200" />,
     },
     {
       id: 'pool',
@@ -2073,7 +2523,7 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
         </div>
       )}
 
-      {/* FULL-SCREEN MODE GAME ARENA */}
+      {/* FULL-SCREEN MODE GAME ARENA + LIVE IN-GAME VOICE CHAT */}
       {activeGame && (
         <div
           className="fixed inset-0 z-50 flex flex-col overflow-y-auto text-white"
@@ -2084,7 +2534,13 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
             <div className="flex items-center gap-2.5">
               <button
                 type="button"
-                onClick={() => setActiveGame(null)}
+                onClick={() => {
+                  if (gameVoiceJoined) {
+                    ogRealtime.leaveGameVoice(matchVoiceId);
+                    setGameVoiceJoined(false);
+                  }
+                  setActiveGame(null);
+                }}
                 className="inline-flex items-center gap-1 rounded-full border border-white/20 bg-white/10 px-3 py-1.5 text-xs font-bold text-white hover:bg-white/20"
               >
                 <ChevronLeft className="h-4 w-4" />
@@ -2101,11 +2557,11 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
                     </h2>
                     <span className="inline-flex items-center gap-1 rounded-full border border-amber-400/40 bg-amber-500/20 px-2 py-0.5 text-[9px] font-bold text-amber-200">
                       <Maximize2 className="h-2.5 w-2.5" />
-                      FULL SCREEN
+                      LIVE MATCH
                     </span>
                   </div>
                   <div className="text-[10.5px] text-slate-300">
-                    Squad: {squadPlayers.map((p) => p.name).join(' · ')}
+                    Real Squad ({squadPlayers.length}): {squadPlayers.map((p) => p.name).join(' · ')}
                   </div>
                 </div>
               </div>
@@ -2138,8 +2594,86 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
             </div>
           </header>
 
+          {/* Live Game Voice Chat Bar */}
+          <div className="mx-auto mt-3 flex w-full max-w-2xl flex-wrap items-center justify-between gap-2 px-4">
+            <div className="flex flex-1 flex-wrap items-center justify-between gap-2 rounded-2xl border border-emerald-400/30 bg-[#0A1324]/90 px-3.5 py-2 backdrop-blur-md">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`h-2.5 w-2.5 rounded-full ${
+                    gameVoiceJoined ? 'animate-pulse bg-emerald-400' : 'bg-slate-500'
+                  }`}
+                />
+                <div className="text-xs font-bold text-white">
+                  Game Voice Chat{' '}
+                  <span className="font-normal text-slate-400">
+                    ({gameVoiceJoined ? `${Math.max(1, gameVoicePeers.length)} connected` : 'Disconnected'})
+                  </span>
+                </div>
+                {gameVoicePeers.length > 0 && (
+                  <div className="flex items-center gap-1">
+                    {gameVoicePeers.slice(0, 4).map((peer) => (
+                      <span
+                        key={peer.publicId}
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                          peer.muted
+                            ? 'bg-white/10 text-slate-400'
+                            : 'bg-emerald-500/20 text-emerald-200'
+                        }`}
+                      >
+                        {peer.name}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleToggleGameVoice}
+                  className={`inline-flex items-center gap-1 rounded-xl px-3 py-1.5 text-[11px] font-extrabold transition-colors ${
+                    gameVoiceJoined
+                      ? 'border border-rose-400/45 bg-rose-500/20 text-rose-200 hover:bg-rose-500/30'
+                      : 'bg-emerald-500 text-slate-950 hover:bg-emerald-400'
+                  }`}
+                >
+                  <Mic className="h-3.5 w-3.5" />
+                  <span>{gameVoiceJoined ? 'Leave Voice' : 'Join Voice'}</span>
+                </button>
+
+                {gameVoiceJoined && (
+                  <button
+                    type="button"
+                    onClick={handleToggleGameMic}
+                    aria-label={gameVoiceMuted ? 'Unmute game mic' : 'Mute game mic'}
+                    className={`flex h-8 w-8 items-center justify-center rounded-xl border ${
+                      gameVoiceMuted
+                        ? 'border-rose-400/45 bg-rose-500/20 text-rose-200'
+                        : 'border-emerald-400/45 bg-emerald-500/20 text-emerald-200'
+                    }`}
+                  >
+                    {gameVoiceMuted ? <MicOff className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleToggleGameSpeaker}
+                  aria-label={gameSpeakerMuted ? 'Unmute game audio' : 'Mute game audio'}
+                  className={`flex h-8 w-8 items-center justify-center rounded-xl border ${
+                    gameSpeakerMuted
+                      ? 'border-amber-400/45 bg-amber-500/20 text-amber-200'
+                      : 'border-white/15 bg-white/5 text-slate-200'
+                  }`}
+                >
+                  {gameSpeakerMuted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+                </button>
+              </div>
+            </div>
+          </div>
+
           {/* Centered Full-Screen Playable Stage */}
-          <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center px-4 py-5">
+          <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center px-4 py-4">
             {lastRewardMsg && (
               <div className="mb-3 flex items-center justify-center gap-2 rounded-2xl border border-amber-400/35 bg-amber-500/20 px-4 py-2 text-xs font-bold text-amber-200 backdrop-blur-md">
                 <ZayroCoinArt size={16} />
@@ -2148,10 +2682,34 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
             )}
 
             <div className="rounded-3xl border border-white/15 bg-[#0A101E]/90 p-4 shadow-[0_24px_70px_rgba(0,0,0,0.85)] backdrop-blur-md sm:p-5">
-              {activeGame === 'carrom' && <CarromBoardGame players={squadPlayers} onReward={handleReward} />}
-              {activeGame === 'pool' && <EightBallPoolGame players={squadPlayers} onReward={handleReward} />}
-              {activeGame === 'racing' && <CarRacingGame players={squadPlayers} onReward={handleReward} />}
-              {activeGame === 'truth-dare' && <TruthOrDareGame players={squadPlayers} onReward={handleReward} />}
+              {activeGame === 'carrom' && (
+                <CarromBoardGame
+                  players={squadPlayers}
+                  onInviteFriends={() => setShowInviteModal(true)}
+                  onReward={handleReward}
+                />
+              )}
+              {activeGame === 'pool' && (
+                <EightBallPoolGame
+                  players={squadPlayers}
+                  onInviteFriends={() => setShowInviteModal(true)}
+                  onReward={handleReward}
+                />
+              )}
+              {activeGame === 'racing' && (
+                <CarRacingGame
+                  players={squadPlayers}
+                  onInviteFriends={() => setShowInviteModal(true)}
+                  onReward={handleReward}
+                />
+              )}
+              {activeGame === 'ludo' && (
+                <LudoGame
+                  players={squadPlayers}
+                  onInviteFriends={() => setShowInviteModal(true)}
+                  onReward={handleReward}
+                />
+              )}
             </div>
           </div>
         </div>
@@ -2192,7 +2750,19 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
                 </p>
               ) : (
                 friends.map((fr) => {
-                  const av = AVATAR_ROSTER.find((a) => a.id === fr.avatarId) ?? AVATAR_ROSTER[0];
+                  const av: AvatarConfig = {
+                    id: fr.avatarId || 'av-neutral',
+                    uid: fr.uid,
+                    publicId: fr.publicId || fr.uid,
+                    name: fr.name,
+                    handle: `@${fr.name.toLowerCase().replace(/\s+/g, '')}`,
+                    photoUrl: fr.photoUrl ?? undefined,
+                    skinTone: '#D69E76',
+                    hairColor: '#1E293B',
+                    robeColor: '#06B6D4',
+                    accentColor: '#A5F3FC',
+                    ornament: 'crown',
+                  };
                   const invited = invitedFriendUids.includes(fr.uid);
                   return (
                     <div
@@ -2200,7 +2770,7 @@ export const GamesSection: React.FC<GamesSectionProps> = ({
                       className="flex items-center justify-between rounded-2xl bg-[#132038] px-3 py-2.5"
                     >
                       <div className="flex items-center gap-2.5">
-                        <AvatarArt avatar={av} size={34} />
+                        <AvatarArt avatar={av} size={34} frameId={fr.equippedFrameId ?? undefined} />
                         <div>
                           <div className="text-xs font-bold text-white">{fr.name}</div>
                           <div className="font-mono-tabular text-[10px] text-slate-400">

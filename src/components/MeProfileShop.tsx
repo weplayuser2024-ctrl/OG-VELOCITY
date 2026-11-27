@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  AlertTriangle,
   Award,
   Camera,
   Check,
@@ -18,24 +19,27 @@ import {
   Heart,
   Image,
   Lock,
+  LogOut,
   Mic,
+  Moon,
   MoreVertical,
   Plus,
-  QrCode,
   Settings,
+  Share2,
   Shield,
   ShoppingBag,
   Sparkles,
   Star,
+  Sun,
   Trophy,
   Upload,
   User,
+  UserPlus,
   Video,
   Wand2,
   XCircle,
 } from 'lucide-react';
 import {
-  AVATAR_ROSTER,
   CHARM_LEVELS,
   COIN_PACKAGES,
   CP_LEVELS,
@@ -55,7 +59,6 @@ import { GiftArtwork } from '../graphics/GiftArtwork';
 import {
   CharmBadgeArt,
   CharmBadgePill,
-  ChatFrameSpriteArt,
   RingSpriteArt,
   RoomLevelBadgeArt,
   SeatFrameSpriteArt,
@@ -64,17 +67,26 @@ import {
 } from '../graphics/SpriteArtwork';
 import type {
   AvatarConfig,
+  BackendOrderRecord,
+  BackendWalletTx,
+  CpRelationshipHistoryRecord,
   CpRequest,
   CustomGiftSubmission,
   FriendRecord,
   MomentPost,
   PublicUserProfile,
+  ReferralSummary,
   ShopCategory,
   ShopItem,
+  VipDecayConfig,
+  VipPointLedgerRecord,
+  VipSubscriptionHistoryRecord,
   VirtualGift,
   VoiceRoom,
 } from '../types';
+import { uploadImageAsset, uploadVideoAsset } from '../utils/mediaUpload';
 import { soundFx } from '../utils/soundFx';
+import { CoupleHomeModal } from './CoupleHomeModal';
 
 export type MeViewMode =
   | 'profile'
@@ -88,40 +100,59 @@ export type MeViewMode =
   | 'visitors'
   | 'cp'
   | 'create-gift'
+  | 'invite'
   | 'privacy';
 
 interface MeProfileShopProps {
+  authToken?: string | null;
   userProfile: AvatarConfig;
   coins: number;
   charm: number;
   vipGrowth: number;
   vipLevel: number;
+  vipEarnedLevel?: number;
+  vipStatus?: 'Not Active' | 'Active';
   vipLabel: string | null;
+  vipExpiresAt?: string | null;
+  vipGraceEndsAt?: string | null;
+  vipNextDecayAt?: string | null;
+  vipInGracePeriod?: boolean;
+  vipGraceDays?: number;
+  vipDecayConfig?: VipDecayConfig | null;
+  vipPointLedger?: VipPointLedgerRecord[];
+  vipSubscriptionHistory?: VipSubscriptionHistoryRecord[];
+  giftsReceivedCount?: number;
+  accountStatus?: 'Active' | 'Suspended';
   ownedItemIds: string[];
+  ownedItemExpiries?: Record<string, number>;
   equippedItems: Partial<Record<ShopCategory, string>>;
   moments: MomentPost[];
   rooms: VoiceRoom[];
   friends?: FriendRecord[];
   cpRequests?: CpRequest[];
+  cpRelationshipHistory?: CpRelationshipHistoryRecord[];
   customGifts?: CustomGiftSubmission[];
   receivedGiftIds: string[];
-  customQrUrl: string | null;
+  vipPackages?: Array<{ id: string; name: string; priceInr: number; durationDays?: number; coinsIncluded?: number; vipLevel?: number; perks?: string[] }>;
+  coinPackages?: Array<{ id: string; label: string; coins: number; priceInr: number; highlight?: string }>;
+  orders?: BackendOrderRecord[];
+  walletFrozen?: boolean;
+  themeMode?: 'dark' | 'light';
+  walletTransactions?: BackendWalletTx[];
   defaultTab?: MeViewMode;
   giftAnimationsEnabled?: boolean;
   onToggleGiftAnimations?: () => void;
+  onToggleThemeMode?: () => void;
   onUpdateProfile: (updates: Partial<AvatarConfig>) => void;
-  onBuyCoins: (amount: number, priceInr: number) => void;
-  onBuyVip: (
-    planName: string,
-    priceInr: number,
-    grantedVipLevel: number,
-    bonusGrowth: number
-  ) => void;
+  onCreatePaymentOrder?: (orderType: 'vip' | 'coins', packageId: string) => Promise<void>;
+  onReopenOrderModal?: (order: BackendOrderRecord) => void;
+  onBuyCoins: (packageId: string) => Promise<{ ok: boolean; message: string }>;
+  onBuyVip: (planId: string) => Promise<{ ok: boolean; message: string }>;
   onBuyShopItem: (item: ShopItem) => void;
   onEquipShopItem: (item: ShopItem) => void;
-  onUploadQrCode: (dataUrl: string) => void;
   onJoinRoom: (roomId: string) => void;
   onInspectUser?: (profile: PublicUserProfile) => void;
+  onInspectUserById?: (uid: string) => void;
   onProposeCp?: (
     toUid: string,
     toName: string,
@@ -131,10 +162,27 @@ interface MeProfileShopProps {
   ) => void;
   onRespondCpRequest?: (requestId: string, accept: boolean) => void;
   onBreakCp?: () => void;
+  shopItems?: ShopItem[];
+  referralSummary?: ReferralSummary | null;
+  onClaimReferralCode?: (code: string) => Promise<{ ok: boolean; message: string }>;
   onSubmitCustomGift?: (
     submission: Omit<CustomGiftSubmission, 'id' | 'creatorUid' | 'creatorName' | 'status' | 'submittedAt'>
   ) => void;
-  onReviewCustomGift?: (giftId: string, status: 'approved' | 'rejected', reviewNote?: string) => void;
+  onInviteFriendApp?: () => void;
+  onLogout?: () => void;
+}
+
+function formatRemainingDuration(expiresAt?: number, durationDays?: number): string {
+  if (expiresAt) {
+    const diffMs = Math.max(0, expiresAt - Date.now());
+    const totalHours = Math.floor(diffMs / 3_600_000);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    if (days > 0) return `${days}d ${hours}h left`;
+    if (hours > 0) return `${hours}h left`;
+    return '<1h left';
+  }
+  return durationDays ? `${durationDays} Days` : 'Permanent';
 }
 
 const ORNAMENTS: AvatarConfig['ornament'][] = [
@@ -147,41 +195,68 @@ const ORNAMENTS: AvatarConfig['ornament'][] = [
 ];
 
 export const MeProfileShop: React.FC<MeProfileShopProps> = ({
+  authToken,
   userProfile,
   coins,
   charm,
   vipGrowth,
   vipLevel,
+  vipEarnedLevel = 0,
+  vipStatus = vipLevel > 0 ? 'Active' : 'Not Active',
   vipLabel,
+  vipExpiresAt = null,
+  vipGraceEndsAt = null,
+  vipNextDecayAt = null,
+  vipInGracePeriod = false,
+  vipGraceDays = 15,
+  vipDecayConfig = null,
+  vipPointLedger = [],
+  vipSubscriptionHistory = [],
+  giftsReceivedCount,
+  accountStatus = 'Active',
   ownedItemIds,
+  ownedItemExpiries = {},
   equippedItems,
   moments,
   rooms,
   friends = [],
   cpRequests = [],
+  cpRelationshipHistory = [],
   customGifts = [],
   receivedGiftIds,
-  customQrUrl,
+  vipPackages,
+  coinPackages,
+  orders = [],
+  walletFrozen = false,
+  themeMode = 'dark',
+  walletTransactions = [],
   defaultTab = 'profile',
   giftAnimationsEnabled = true,
   onToggleGiftAnimations,
+  onToggleThemeMode,
   onUpdateProfile,
+  onCreatePaymentOrder,
+  onReopenOrderModal,
   onBuyCoins,
   onBuyVip,
   onBuyShopItem,
   onEquipShopItem,
-  onUploadQrCode,
   onJoinRoom,
   onInspectUser,
+  onInspectUserById,
   onProposeCp,
   onRespondCpRequest,
   onBreakCp,
+  shopItems,
+  referralSummary = null,
+  onClaimReferralCode,
   onSubmitCustomGift,
-  onReviewCustomGift,
+  onInviteFriendApp,
+  onLogout,
 }) => {
   const [activeView, setActiveView] = useState<MeViewMode>(defaultTab);
   const [shopCategory, setShopCategory] = useState<
-    'ring' | 'decorations' | 'voice' | 'items' | 'all'
+    'ring' | 'decorations' | 'voice' | 'items' | 'inventory' | 'all'
   >('ring');
   const [nameInput, setNameInput] = useState(userProfile.name);
   const [handleInput, setHandleInput] = useState(userProfile.handle.replace(/^@/, ''));
@@ -194,12 +269,14 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
   const [tagsInput, setTagsInput] = useState<string[]>(userProfile.tags ?? []);
   const [newTagDraft, setNewTagDraft] = useState('');
   const [showAddTagInput, setShowAddTagInput] = useState(false);
-  const [emailInput, setEmailInput] = useState(userProfile.email || '');
-  const [editingEmail, setEditingEmail] = useState(false);
   const [showCpPartnerId, setShowCpPartnerId] = useState(false);
-  const [cpTargetUid, setCpTargetUid] = useState(friends[0]?.uid || AVATAR_ROSTER[0].uid);
+  const [showRingCollection, setShowRingCollection] = useState(false);
+  const [cpTargetUid, setCpTargetUid] = useState(friends[0]?.publicId || friends[0]?.uid || '');
+  const [cpTargetNameDraft, setCpTargetNameDraft] = useState('');
   const [cpRingNumber, setCpRingNumber] = useState(1);
   const [copiedPartnerId, setCopiedPartnerId] = useState(false);
+  const [copiedOwnId, setCopiedOwnId] = useState(false);
+  const [inviteCopied, setInviteCopied] = useState(false);
   const [ornamentInput, setOrnamentInput] = useState<AvatarConfig['ornament']>(
     userProfile.ornament
   );
@@ -208,7 +285,8 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
   const [hideOnlineStatus, setHideOnlineStatus] = useState(false);
   const [savedBanner, setSavedBanner] = useState(false);
   const [purchaseNotice, setPurchaseNotice] = useState<string | null>(null);
-  const [selectedVipPreview] = useState<number>(Math.max(2, vipLevel));
+  const [mediaUploadPct, setMediaUploadPct] = useState<number | null>(null);
+  const [selectedVipPreview] = useState<number>(Math.max(1, vipLevel));
   const [coverIndex, setCoverIndex] = useState(0);
 
   // Create Gift Studio state
@@ -222,7 +300,9 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
   const [cgArtworkUrl, setCgArtworkUrl] = useState<string | undefined>(undefined);
   const [cgVideoUrl, setCgVideoUrl] = useState<string | undefined>(undefined);
   const [cgVideoName, setCgVideoName] = useState('');
-  const [cgRejectNotes, setCgRejectNotes] = useState<Record<string, string>>({});
+  const [claimInviteInput, setClaimInviteInput] = useState('');
+  const [claimingInvite, setClaimingInvite] = useState(false);
+  const [claimInviteFeedback, setClaimInviteFeedback] = useState<{ ok: boolean; message: string } | null>(null);
 
   const COVER_GRADIENTS = [
     'radial-gradient(circle at 50% 35%, rgba(34,211,238,0.22), transparent 55%), linear-gradient(180deg, #070B14 0%, #0D1526 72%, #0A101D 100%)',
@@ -231,17 +311,25 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
   ];
 
   const openCpPartnerProfile = () => {
-    if (!userProfile.cpPartner || !onInspectUser) return;
+    if (!userProfile.cpPartner) return;
     const cp = userProfile.cpPartner;
-    const baseAv =
-      AVATAR_ROSTER.find((a) => a.uid === cp.partnerUid || a.id === cp.partnerAvatarId) ??
-      AVATAR_ROSTER[0];
+    if (onInspectUserById) {
+      onInspectUserById(cp.partnerUid);
+      return;
+    }
+    if (!onInspectUser) return;
     onInspectUser({
       avatar: {
-        ...baseAv,
-        id: cp.partnerAvatarId || baseAv.id,
+        id: cp.partnerAvatarId || 'av-neutral',
         uid: cp.partnerUid,
         name: cp.partnerName,
+        handle: `@${cp.partnerName.toLowerCase().replace(/\s+/g, '')}`,
+        photoUrl: cp.partnerPhotoUrl ?? undefined,
+        skinTone: '#D69E76',
+        hairColor: '#1E293B',
+        robeColor: '#06B6D4',
+        accentColor: '#A5F3FC',
+        ornament: 'lotus',
         cpPartner: {
           partnerUid: userProfile.uid,
           partnerName: userProfile.name,
@@ -252,8 +340,8 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
           cpCharm: cp.cpCharm,
         },
       },
-      vipLevel: 7,
-      charm: Math.max(120_000, cp.cpCharm ?? 0),
+      vipLevel: 0,
+      charm: cp.cpCharm ?? 0,
       cpPartner: {
         partnerUid: userProfile.uid,
         partnerName: userProfile.name,
@@ -267,14 +355,16 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
     });
   };
 
+  const catalogItems = shopItems && shopItems.length > 0 ? shopItems : SHOP_ITEMS;
   const { current: charmInfo, next: nextCharmInfo } = getCharmLevelInfo(charm);
-  const { current: growthVipTier, next: nextVipTier } = getVipTierByGrowth(vipGrowth);
-  const effectiveVipLevel = Math.min(18, Math.max(vipLevel, growthVipTier.level));
-  const equippedRing = SHOP_ITEMS.find((i) => i.id === equippedItems.ring);
-  const equippedFrame = SHOP_ITEMS.find((i) => i.id === equippedItems.frame);
-  const ringCatalog = SHOP_ITEMS.filter((i) => i.category === 'ring');
+  const isVipActive = vipStatus === 'Active';
+  const { current: growthVipTier, next: nextVipTier } = getVipTierByGrowth(vipGrowth, isVipActive);
+  const effectiveVipLevel = isVipActive ? Math.min(18, Math.max(vipLevel, growthVipTier.level)) : 0;
+  const equippedRing = catalogItems.find((i) => i.id === equippedItems.ring);
+  const equippedFrame = catalogItems.find((i) => i.id === equippedItems.frame);
+  const ringCatalog = catalogItems.filter((i) => i.category === 'ring');
   const ownedRings = ringCatalog.filter((r) => ownedItemIds.includes(r.id));
-  const selectedOwnedRing =
+  const selectedBondRing =
     ownedRings.find((r) => r.ringNumber === cpRingNumber) ?? ownedRings[0];
 
   const formattedCharm =
@@ -293,76 +383,82 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
       age: Number.isFinite(ageInput) ? Math.max(13, Math.min(99, ageInput)) : 21,
       country: countryInput,
       tags: tagsInput.slice(0, 5),
-      email: emailInput.trim(),
       ornament: ornamentInput,
     });
-    setEditingEmail(false);
     setSavedBanner(true);
     soundFx.playVictory();
     window.setTimeout(() => setSavedBanner(false), 2200);
   };
 
-  const handleAvatarPhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleAvatarPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        onUpdateProfile({ photoUrl: reader.result });
-        setPurchaseNotice('Profile photo updated!');
-        soundFx.playVictory();
-      }
-    };
-    reader.readAsDataURL(file);
+    setMediaUploadPct(10);
+    setPurchaseNotice('Uploading profile photo...');
+    try {
+      const uploadedUrl = await uploadImageAsset(file, {
+        authToken,
+        maxDim: 720,
+        quality: 0.85,
+        maxCompressedBytes: 550_000,
+        onProgress: (pct) => setMediaUploadPct(pct),
+      });
+      onUpdateProfile({ photoUrl: uploadedUrl });
+      setPurchaseNotice('Profile photo updated!');
+      soundFx.playVictory();
+    } catch (err) {
+      setPurchaseNotice(err instanceof Error ? err.message : 'Could not upload photo. Please try again.');
+    } finally {
+      setMediaUploadPct(null);
+    }
   };
 
-  const handleCoverPhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleCoverPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        onUpdateProfile({ coverUrl: reader.result });
-        setPurchaseNotice('Profile cover photo updated!');
-        soundFx.playVictory();
-      }
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const handleQrFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        onUploadQrCode(reader.result);
-        setPurchaseNotice('Custom Payment QR Code updated!');
-      }
-    };
-    reader.readAsDataURL(file);
+    setMediaUploadPct(10);
+    setPurchaseNotice('Uploading profile cover photo...');
+    try {
+      const uploadedUrl = await uploadImageAsset(file, {
+        authToken,
+        maxDim: 1440,
+        quality: 0.85,
+        maxCompressedBytes: 750_000,
+        onProgress: (pct) => setMediaUploadPct(pct),
+      });
+      onUpdateProfile({ coverUrl: uploadedUrl });
+      setPurchaseNotice('Profile cover photo updated!');
+      soundFx.playVictory();
+    } catch (err) {
+      setPurchaseNotice(err instanceof Error ? err.message : 'Could not upload cover photo. Please try again.');
+    } finally {
+      setMediaUploadPct(null);
+    }
   };
 
   const visibleShopItems = (
-    shopCategory === 'all'
-      ? SHOP_ITEMS
-      : shopCategory === 'ring'
-        ? SHOP_ITEMS.filter((i) => i.category === 'ring')
-        : shopCategory === 'decorations'
-          ? SHOP_ITEMS.filter((i) => i.category === 'frame' || i.category === 'bubble')
-          : shopCategory === 'voice'
-            ? SHOP_ITEMS.filter(
-                (i) =>
-                  i.category === 'entry' ||
-                  i.category === 'seat-fx' ||
-                  i.category === 'room-theme'
-              )
-            : SHOP_ITEMS.filter((i) => i.category === 'bubble' || i.category === 'seat-fx')
+    shopCategory === 'inventory'
+      ? catalogItems.filter((i) => ownedItemIds.includes(i.id))
+      : shopCategory === 'all'
+        ? catalogItems
+        : shopCategory === 'ring'
+          ? catalogItems.filter((i) => i.category === 'ring')
+          : shopCategory === 'decorations'
+            ? catalogItems.filter((i) => i.category === 'frame')
+            : shopCategory === 'voice'
+              ? catalogItems.filter(
+                  (i) =>
+                    i.category === 'entry' ||
+                    i.category === 'seat-fx' ||
+                    i.category === 'room-theme'
+                )
+              : catalogItems.filter((i) => i.category === 'seat-fx' || i.category === 'room-theme')
   )
     .slice()
     .sort((a, b) => (a.ringNumber ?? 999) - (b.ringNumber ?? 999));
 
-  const ownTags = ['Bro 🤝', 'Sister 🍀', 'Bestie 🎀'];
   const previewVipInfo = VIP_TIERS.find((v) => v.level === selectedVipPreview) ?? VIP_TIERS[1];
 
   return (
@@ -386,9 +482,26 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
         </div>
       )}
 
+      {walletFrozen && (
+        <div className="flex items-center gap-2.5 rounded-2xl border border-rose-400/50 bg-rose-500/15 px-4 py-3 text-xs font-bold text-rose-200">
+          <AlertTriangle className="h-4 w-4 shrink-0 text-rose-300" />
+          <span>
+            Wallet Frozen by Admin Moderation — Gift sending and Shop purchases are temporarily suspended. Contact Super Admin support for review.
+          </span>
+        </div>
+      )}
+
       {purchaseNotice && (
         <div className="rounded-xl border border-emerald-400/35 bg-emerald-500/15 px-4 py-3 text-xs font-semibold text-emerald-200">
-          {purchaseNotice}
+          <div>{purchaseNotice}</div>
+          {mediaUploadPct !== null && (
+            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full bg-emerald-400 transition-all duration-200"
+                style={{ width: `${mediaUploadPct}%` }}
+              />
+            </div>
+          )}
         </div>
       )}
 
@@ -396,20 +509,12 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
       {activeView === 'profile' && (() => {
         const myCpCharm = userProfile.cpPartner?.cpCharm ?? 0;
         const myCpLvl = getCpLevelInfo(myCpCharm);
-        const myBlessing = userProfile.blessing ?? Math.max(120, Math.round(charm / 40));
-        const cpPartnerAv = userProfile.cpPartner
-          ? AVATAR_ROSTER.find(
-              (a) =>
-                a.uid === userProfile.cpPartner?.partnerUid ||
-                a.id === userProfile.cpPartner?.partnerAvatarId
-            ) ?? userProfile
-          : userProfile;
         return (
         <div className="space-y-5">
           {/* Top Cover Banner */}
-          <section className="overflow-hidden rounded-3xl border border-cyan-500/15 bg-[#0D1526]">
+          <section className="overflow-visible rounded-3xl border border-cyan-500/15 bg-[#0D1526]">
             <div
-              className="relative h-48 w-full bg-cover bg-center"
+              className="relative h-48 w-full overflow-hidden rounded-t-3xl bg-cover bg-center"
               style={
                 userProfile.coverUrl
                   ? { backgroundImage: `linear-gradient(to bottom, rgba(7,11,20,0.22), rgba(7,11,20,0.78)), url(${userProfile.coverUrl})` }
@@ -459,53 +564,57 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 </div>
               </div>
 
-              {/* Compact Frosted Rose-Gold Blessing + Ring + CP Partner Pill */}
-              <button
-                type="button"
-                onClick={() => {
-                  if (userProfile.cpPartner) {
-                    if (onInspectUser) {
-                      openCpPartnerProfile();
-                    } else {
-                      setShowCpPartnerId((v) => !v);
-                    }
-                  } else {
-                    setShopCategory('ring');
-                    setActiveView('shop');
-                  }
-                }}
-                className="absolute right-2.5 bottom-2.5 flex items-center gap-1.5 rounded-full border border-rose-300/35 bg-gradient-to-r from-[#4B1A2F]/90 via-[#5D223D]/90 to-[#3D1628]/90 py-1 pr-1 pl-2 shadow-[0_4px_16px_rgba(244,63,94,0.28)] backdrop-blur-md transition-transform hover:scale-[1.02]"
-                title={userProfile.cpPartner ? `Open ${userProfile.cpPartner.partnerName}'s Profile` : 'Open Ring Shop'}
-              >
-                <RingSpriteArt
-                  ringNumber={userProfile.cpPartner?.ringNumber ?? equippedRing?.ringNumber ?? 1}
-                  size={28}
-                  alt="Equipped Ring"
-                />
-                <div className="text-left leading-tight">
-                  <div className="flex items-center gap-1 text-[9px] font-semibold text-rose-100">
-                    <Heart className="h-2 w-2 fill-white text-white" />
-                    <span>{userProfile.cpPartner ? 'CP Partner' : 'Blessing'}</span>
-                  </div>
-                  <div className="flex items-center gap-0.5 font-mono-tabular text-xs font-extrabold text-white">
-                    <span>{myBlessing.toLocaleString()}</span>
-                    <Heart className="h-2 w-2 fill-rose-200 text-rose-200" />
-                  </div>
-                </div>
-                <div className="overflow-hidden rounded-full border border-white/40">
-                  <AvatarArt avatar={cpPartnerAv} size={26} />
-                </div>
-              </button>
+              {/* Rose Frosted Ring / Couple Pill -> Shown ONLY when user has an active CP partner */}
+              {userProfile.cpPartner && (() => {
+                const cp = userProfile.cpPartner;
+                const cpAv: AvatarConfig = {
+                  ...userProfile,
+                  id: cp.partnerAvatarId || 'av-neutral',
+                  uid: cp.partnerUid,
+                  name: cp.partnerName,
+                  photoUrl: cp.partnerPhotoUrl ?? undefined,
+                };
+                return (
+                  <button
+                    type="button"
+                    onClick={() => setShowRingCollection(true)}
+                    className="absolute right-3 bottom-3 flex items-center gap-2 rounded-2xl border border-rose-200/35 bg-gradient-to-r from-[#E6859C]/90 via-[#EE9BAE]/88 to-[#F3B0BF]/85 px-2.5 py-1.5 shadow-xl backdrop-blur-md transition-transform hover:scale-105"
+                    title="View Ring Collection & Couple Home"
+                  >
+                    <RingSpriteArt
+                      ringNumber={cp.ringNumber}
+                      size={38}
+                      alt="CP Ring"
+                    />
+                    <div className="text-left leading-tight">
+                      <div className="flex items-center gap-1 text-[10px] font-bold text-white/95">
+                        <Heart className="h-2.5 w-2.5 fill-white text-white" />
+                        <span>CP Love</span>
+                      </div>
+                      <div className="font-mono-tabular text-xs font-extrabold text-white">
+                        {(cp.cpCharm ?? userProfile.blessing ?? 0).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="rounded-full border border-white/80 bg-[#1B1226]">
+                      <AvatarArt avatar={cpAv} size={32} />
+                    </div>
+                  </button>
+                );
+              })()}
             </div>
 
             <div className="px-5 pb-5">
               <div className="flex flex-wrap items-end justify-between gap-4">
-                <div className="relative -mt-12 inline-block">
+                <div className="relative -mt-12 inline-block overflow-visible">
                   <div
-                    className="rounded-full border-2 border-white/25 bg-[#0D1526] p-0.5"
+                    className={
+                      equippedFrame
+                        ? 'relative overflow-visible'
+                        : 'rounded-full border-2 border-white/25 bg-[#0D1526] p-0.5'
+                    }
                     style={
                       equippedFrame && !equippedItems.frame?.startsWith('frame-fire') && !equippedItems.frame?.startsWith('frame-ice') && !equippedItems.frame?.startsWith('frame-flower') && !equippedItems.frame?.startsWith('frame-chair') && !equippedItems.frame?.startsWith('frame-room')
-                        ? { boxShadow: `0 0 18px ${equippedFrame.previewColor}` }
+                        ? { filter: `drop-shadow(0 0 12px ${equippedFrame.previewColor})` }
                         : undefined
                     }
                   >
@@ -513,12 +622,13 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                       avatar={userProfile}
                       size={82}
                       frameId={equippedItems.frame}
+                      frameImageUrl={equippedFrame?.imageUrl}
                     />
                   </div>
                   <label
                     title="Upload Real Profile Photo"
                     aria-label="Upload Real Profile Photo"
-                    className="absolute right-0.5 bottom-0.5 z-20 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full border-2 border-[#0D1526] bg-cyan-500 text-slate-950 hover:bg-cyan-400"
+                    className="absolute right-0.5 bottom-0.5 z-30 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full border-2 border-[#0D1526] bg-cyan-500 text-slate-950 hover:bg-cyan-400"
                   >
                     <Camera className="h-3.5 w-3.5" />
                     <input
@@ -540,8 +650,15 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 </button>
               </div>
 
-              {/* Bold VIP-Colored Name + VIP Badge beside name (matching IMG_20261119_144826) */}
+              {/* Gender (left of name) + Bold VIP-Colored Name + VIP Badge */}
               <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                <span
+                  className="text-base leading-none"
+                  title={userProfile.gender || 'Male'}
+                  aria-label={`Gender: ${userProfile.gender || 'Male'}`}
+                >
+                  {getGenderSymbol(userProfile.gender)}
+                </span>
                 <h1
                   className="font-display text-2xl font-black tracking-tight"
                   style={getVipNameStyle(effectiveVipLevel)}
@@ -565,9 +682,26 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   <span className="h-2 w-2 rounded-full bg-emerald-400" />
                   <span>{hideOnlineStatus ? 'Hidden' : 'Online'}</span>
                 </span>
-                <span className="inline-flex items-center gap-1 font-mono-tabular text-slate-400">
-                  <Lock className="h-3 w-3 text-amber-300" />
-                  {userProfile.uid}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const idToCopy = userProfile.publicId || userProfile.uid;
+                    navigator.clipboard?.writeText(idToCopy).catch(() => {});
+                    setCopiedOwnId(true);
+                    window.setTimeout(() => setCopiedOwnId(false), 1800);
+                  }}
+                  title="Copy User ID"
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-0.5 font-mono-tabular text-slate-300 transition-colors hover:border-cyan-400/40 hover:text-white"
+                >
+                  <span>ID: {userProfile.publicId || userProfile.uid}</span>
+                  {copiedOwnId ? (
+                    <Check className="h-3 w-3 text-emerald-400" />
+                  ) : (
+                    <Copy className="h-3 w-3 text-cyan-300" />
+                  )}
+                </button>
+                <span className="inline-flex items-center gap-1 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold text-emerald-300">
+                  {accountStatus}
                 </span>
               </div>
 
@@ -589,8 +723,19 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 >
                   <VipBadgeArt level={effectiveVipLevel} size={22} />
                   <span style={effectiveVipLevel >= 12 ? getVipNameStyle(effectiveVipLevel) : undefined}>
-                    {vipLabel || `VIP ${effectiveVipLevel}`}
+                    {vipStatus === 'Active' && effectiveVipLevel > 0
+                      ? vipLabel || `VIP ${effectiveVipLevel}`
+                      : 'VIP 0 · Not Active'}
                   </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveView('gifts')}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-pink-400/30 bg-[#132038] px-3 py-1 text-xs font-bold text-pink-200 hover:border-pink-400/60"
+                >
+                  <Gift className="h-3.5 w-3.5 text-pink-400" />
+                  <span>Gifts {(giftsReceivedCount ?? receivedGiftIds.length).toLocaleString()}</span>
                 </button>
 
                 {userProfile.cpPartner ? (
@@ -868,67 +1013,41 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   </div>
                   <div>
                     <div className="text-sm font-bold text-white">Visitors</div>
-                    <div className="text-xs text-slate-400">See who visited your profile</div>
+                    <div className="text-xs text-slate-400">Profile visit tracking</div>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="rounded-full bg-rose-500 px-2.5 py-0.5 font-mono-tabular text-[10px] font-bold text-white">
-                    +7 new
-                  </span>
                   <ChevronRight className="h-4 w-4 text-slate-500" />
                 </div>
               </button>
             </div>
           </section>
 
-          {/* MORE Section + Payment QR Upload */}
+          {/* MORE Section */}
           <section className="space-y-2">
             <h2 className="px-1 text-[11px] font-bold tracking-wider text-slate-400 uppercase">
               MORE
             </h2>
             <div className="divide-y divide-white/5 overflow-hidden rounded-3xl border border-white/10 bg-[#0D1526]">
-              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
+
+              <button
+                type="button"
+                onClick={() => setActiveView('invite')}
+                className="flex w-full items-center justify-between px-4 py-3.5 text-left transition-colors hover:bg-white/5"
+              >
                 <div className="flex items-center gap-3.5">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/15 text-amber-300">
-                    {customQrUrl ? (
-                      <img
-                        src={customQrUrl}
-                        alt="My Payment QR"
-                        className="h-9 w-9 rounded-lg bg-white object-contain p-0.5"
-                      />
-                    ) : (
-                      <QrCode className="h-5 w-5" />
-                    )}
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/15 text-emerald-300">
+                    <UserPlus className="h-5 w-5" />
                   </div>
                   <div>
-                    <div className="text-sm font-bold text-white">Payment QR Code (Top-Up)</div>
+                    <div className="text-sm font-bold text-white">Invite Friend</div>
                     <div className="text-xs text-slate-400">
-                      {customQrUrl
-                        ? 'Custom QR uploaded & visible in Top-Up'
-                        : 'Upload your QR code image for in-game payments'}
+                      Share invite code {referralSummary?.inviteCode || `OGV-${userProfile.publicId || userProfile.uid}`} &amp; earn +25,000 Coins each
                     </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-amber-400/40 bg-amber-500/15 px-3 py-1.5 text-xs font-semibold text-amber-200 hover:bg-amber-500/25">
-                    <Upload className="h-3.5 w-3.5" />
-                    <span>{customQrUrl ? 'Change QR' : 'Upload QR'}</span>
-                    <input
-                      type="file"
-                      accept="image/*"
-                      onChange={handleQrFileChange}
-                      className="hidden"
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => setActiveView('vip')}
-                    className="rounded-xl bg-cyan-500 px-3 py-1.5 text-xs font-bold text-slate-950 hover:bg-cyan-400"
-                  >
-                    Top-Up
-                  </button>
-                </div>
-              </div>
+                <ChevronRight className="h-4 w-4 text-slate-500" />
+              </button>
 
               <button
                 type="button"
@@ -989,11 +1108,17 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
 
             <button
               type="button"
-              onClick={() => setActiveView('vip')}
-              aria-label="Top Up"
-              className="flex h-9 w-9 items-center justify-center rounded-full border border-amber-400/45 bg-[#2A1712]/80 text-amber-300 shadow-[0_0_14px_rgba(251,191,36,0.4)] hover:bg-amber-500/20"
+              onClick={() => setShopCategory('inventory')}
+              aria-label="My Inventory"
+              title="My Inventory"
+              className={`flex h-9 items-center gap-1.5 rounded-full border px-3 text-[11px] font-extrabold transition-colors ${
+                shopCategory === 'inventory'
+                  ? 'border-amber-300 bg-amber-400 text-slate-950 shadow-[0_0_14px_rgba(251,191,36,0.6)]'
+                  : 'border-amber-400/45 bg-[#2A1712]/80 text-amber-300 shadow-[0_0_14px_rgba(251,191,36,0.4)] hover:bg-amber-500/20'
+              }`}
             >
-              <ShoppingBag className="h-4.5 w-4.5" />
+              <ShoppingBag className="h-4 w-4" />
+              <span>Inventory</span>
             </button>
           </div>
 
@@ -1051,6 +1176,11 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   icon: <Star className="h-3 w-3 fill-amber-300 text-amber-300" />,
                 },
                 {
+                  id: 'inventory',
+                  label: `My Inventory (${ownedItemIds.length})`,
+                  icon: <ShoppingBag className="h-3 w-3 text-amber-300" />,
+                },
+                {
                   id: 'all',
                   label: 'All',
                   icon: <Gamepad2 className="h-3 w-3 text-teal-300" />,
@@ -1083,15 +1213,30 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
               {shopCategory === 'ring'
                 ? 'Rings Collection'
                 : shopCategory === 'decorations'
-                  ? 'Decorations & Frames'
+                  ? 'Avatar & Seat Frames (3 Days)'
                   : shopCategory === 'voice'
                     ? 'Voice Room Effects'
                     : shopCategory === 'items'
-                      ? 'Chat & Seat Items'
-                      : 'All OG VELOCITY Gear'}
+                      ? 'Seat & Room Items'
+                      : shopCategory === 'inventory'
+                        ? 'My Inventory · Purchased Gear'
+                        : 'All OG VELOCITY Gear'}
             </span>
             <Crown className="h-3.5 w-3.5 text-amber-300" />
           </div>
+
+          {shopCategory === 'inventory' && visibleShopItems.length === 0 && (
+            <div className="mx-3 mb-4 rounded-2xl border border-purple-400/30 bg-[#120D1E]/90 p-5 text-center text-xs text-slate-300">
+              <p>You have not purchased any items yet. Buy rings, frames, or entry effects in the Shop to see them here.</p>
+              <button
+                type="button"
+                onClick={() => setShopCategory('ring')}
+                className="mt-3 rounded-xl bg-gradient-to-r from-amber-400 to-orange-500 px-4 py-1.5 text-xs font-extrabold text-slate-950"
+              >
+                Browse Rings
+              </button>
+            </div>
+          )}
 
           {/* 3-Column Obsidian-Teal & Gold-Framed Item Cards */}
           <div className="grid grid-cols-3 gap-2.5 px-3 pb-3">
@@ -1125,16 +1270,34 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   <div className="line-clamp-1 w-full text-[9px] font-bold text-cyan-100/90">
                     {item.name}
                   </div>
+                  {(shopCategory === 'inventory' || item.durationDays) && (
+                    <span
+                      className={`mt-0.5 rounded px-1.5 py-0.5 text-[8px] font-extrabold uppercase ${
+                        item.durationDays
+                          ? 'bg-amber-500/20 text-amber-200'
+                          : 'bg-emerald-500/20 text-emerald-300'
+                      }`}
+                    >
+                      {shopCategory === 'inventory'
+                        ? formatRemainingDuration(ownedItemExpiries[item.id], item.durationDays)
+                        : `${item.durationDays} Days`}
+                    </span>
+                  )}
 
-                  {/* Transparent Cutouts for Rings, Chat Frames & Seat Frames */}
+                  {/* Transparent Cutouts for Rings & Seat Frames */}
                   <div className="my-1.5 flex h-18 items-center justify-center bg-transparent">
                     {item.ringNumber ? (
-                      <RingSpriteArt ringNumber={item.ringNumber} size={70} alt={item.name} />
-                    ) : item.chatFrameNumber ? (
-                      <ChatFrameSpriteArt
-                        frameNumber={item.chatFrameNumber}
+                      <RingSpriteArt
+                        ringNumber={item.ringNumber}
+                        size={70}
                         alt={item.name}
-                        className="h-10 w-24"
+                        imageUrl={item.imageUrl}
+                      />
+                    ) : item.imageUrl ? (
+                      <img
+                        src={item.imageUrl}
+                        alt={item.name}
+                        className="h-16 w-16 rounded-xl object-contain"
                       />
                     ) : item.seatFrameNumber ? (
                       <SeatFrameSpriteArt
@@ -1142,16 +1305,6 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                         size={64}
                         alt={item.name}
                       />
-                    ) : item.category === 'bubble' ? (
-                      <div
-                        className="rounded-xl border-2 px-2 py-1 text-[9px] font-bold text-white"
-                        style={{
-                          borderColor: item.previewColor,
-                          backgroundColor: `${item.previewColor}33`,
-                        }}
-                      >
-                        OG VELOCITY!
-                      </div>
                     ) : item.category === 'frame' ? (
                       <div
                         className="flex h-12 w-12 items-center justify-center rounded-full border-3 text-base"
@@ -1212,9 +1365,7 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                       disabled={!canAfford}
                       onClick={() => {
                         onBuyShopItem(item);
-                        setPurchaseNotice(
-                          `Unlocked ${item.name} (+${Math.floor(item.priceCoins / 100).toLocaleString()} VIP Growth)!`
-                        );
+                        setPurchaseNotice(`Unlocked ${item.name}!`);
                       }}
                       className="inline-flex w-full items-center justify-center gap-1 rounded-full border border-amber-400/70 bg-[#07111F]/90 py-1 font-mono-tabular text-[10px] font-extrabold text-white hover:bg-amber-500/25 disabled:opacity-45"
                     >
@@ -1234,8 +1385,8 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 <div className="text-[10px] font-extrabold text-cyan-200">YOU</div>
                 <div className="font-mono-tabular text-xs font-black text-white">#500+</div>
               </div>
-              <div className="rounded-full border-2 border-cyan-400 p-0.5">
-                <AvatarArt avatar={userProfile} size={32} />
+              <div className="overflow-visible rounded-full border-2 border-cyan-400 p-0.5">
+                <AvatarArt avatar={userProfile} size={32} frameId={equippedItems.frame} />
               </div>
               <div className="min-w-0">
                 <div className="flex items-center gap-1">
@@ -1265,28 +1416,118 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
         </div>
       )}
 
-      {/* SUB-VIEW: VIP Center & INR Top-Up + Custom QR */}
-      {activeView === 'vip' && (
+      {/* SUB-VIEW: VIP Center & Official Permanent Merchant UPI Checkout + Wallet Ledger */}
+      {activeView === 'vip' && (() => {
+        const displayVipPlans = (vipPackages && vipPackages.length > 0 ? vipPackages : VIP_PLANS).map((p) => {
+          const dDays = 'durationDays' in p && p.durationDays ? Number(p.durationDays) : undefined;
+          return {
+            id: p.id,
+            name: p.name,
+            priceInr: p.priceInr,
+            durationDays: dDays,
+            perks:
+              'perks' in p && Array.isArray(p.perks) && p.perks.length > 0
+                ? p.perks
+                : [
+                    'Starts at VIP 1 (or preserves existing earned VIP tier)',
+                    dDays ? `${dDays.toLocaleString()} Days Membership Validity` : 'Verified Membership Validity',
+                    'Earn 1 VIP Point per 100 Coins spent on eligible gifts',
+                  ],
+          };
+        });
+        const displayCoinPacks = coinPackages && coinPackages.length > 0 ? coinPackages : COIN_PACKAGES;
+        const expiryMs = vipExpiresAt ? new Date(vipExpiresAt).getTime() : 0;
+        const daysUntilExpiry = expiryMs > Date.now() ? Math.ceil((expiryMs - Date.now()) / (24 * 60 * 60 * 1000)) : 0;
+        const isExpiringSoon = vipStatus === 'Active' && expiryMs > 0 && daysUntilExpiry <= 7;
+        const graceEndsFormatted = vipGraceEndsAt ? new Date(vipGraceEndsAt).toLocaleDateString() : null;
+        const nextDecayFormatted = vipNextDecayAt ? new Date(vipNextDecayAt).toLocaleDateString() : null;
+        const expiresFormatted = vipExpiresAt ? new Date(vipExpiresAt).toLocaleDateString() : null;
+        const decayActiveAfterGrace = vipStatus !== 'Active' && !vipInGracePeriod && vipGrowth > 0 && Boolean(vipExpiresAt);
+
+        return (
         <div className="space-y-6">
           <div className="rounded-3xl border border-amber-400/25 bg-[#0D1526] p-6 shadow-xl">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
               <div>
                 <h2 className="font-display text-2xl font-bold text-white">
-                  My Membership · VIP Growth (Lv. 1 – 18)
+                  My Membership · VIP Levels (Lv. 1 – 15)
                 </h2>
                 <p className="text-xs text-slate-400">
-                  100 Coins spent = +1 VIP Growth. Thresholds: VIP 1→2 (3,000), VIP 2→3 (8,000), VIP 3→4 (20,000)...
+                  Earn <strong className="text-amber-300">1 VIP Point per 100 Coins</strong> spent on eligible gifts while your VIP subscription is Active. All subscriptions start at VIP 1.
                 </p>
               </div>
               <VipBadgeArt level={effectiveVipLevel} size={50} />
             </div>
 
+            {/* VIP Expiry / Grace / Decay Alerts */}
+            {isExpiringSoon && (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-amber-400/40 bg-amber-500/15 px-4 py-2.5 text-xs text-amber-200">
+                <span>
+                  Your VIP subscription expires in <strong>{daysUntilExpiry} day(s)</strong> ({expiresFormatted}). Renew early to extend validity and prevent point decay!
+                </span>
+              </div>
+            )}
+            {vipStatus !== 'Active' && vipInGracePeriod && vipGrowth > 0 && (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-cyan-400/40 bg-cyan-500/15 px-4 py-2.5 text-xs text-cyan-200">
+                <span>
+                  <strong>Grace Period Active ({vipGraceDays} days):</strong> Your VIP expired on {expiresFormatted || 'recently'}. Point decay is paused until <strong>{graceEndsFormatted}</strong> (Next decay: {nextDecayFormatted}). Renew to stop decay and restore VIP {Math.max(1, vipEarnedLevel || 1)}.
+                </span>
+              </div>
+            )}
+            {decayActiveAfterGrace && (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-rose-400/45 bg-rose-500/15 px-4 py-2.5 text-xs text-rose-200">
+                <span>
+                  <strong>VIP Point Decay Active:</strong> Grace period ended ({graceEndsFormatted}). Remaining {vipGrowth.toLocaleString()} VIP points decay daily ({vipDecayConfig?.mode === 'percent' ? `${vipDecayConfig.dailyPercent}%/day` : `${vipDecayConfig?.dailyAmount ?? 50} pts/day`}). Renew any VIP plan to stop decay immediately!
+                </span>
+              </div>
+            )}
+
+            {/* Status Grid */}
+            <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <div className="rounded-2xl border border-white/10 bg-[#132038] p-3">
+                <div className="text-[10px] font-bold text-slate-400 uppercase">VIP Status</div>
+                <div className={`mt-1 text-sm font-extrabold ${vipStatus === 'Active' ? 'text-emerald-300' : 'text-rose-300'}`}>
+                  {vipStatus}
+                </div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-[#132038] p-3">
+                <div className="text-[10px] font-bold text-slate-400 uppercase">VIP Level</div>
+                <div className="mt-1 font-mono-tabular text-sm font-extrabold text-amber-300">
+                  {vipStatus === 'Active'
+                    ? `VIP ${effectiveVipLevel}`
+                    : vipEarnedLevel > 0
+                      ? `Inactive (Saved Lv.${vipEarnedLevel})`
+                      : 'VIP 0'}
+                </div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-[#132038] p-3">
+                <div className="text-[10px] font-bold text-slate-400 uppercase">Expiry Date</div>
+                <div className="mt-1 font-mono-tabular text-xs font-bold text-white">
+                  {expiresFormatted || 'No Active Plan'}
+                </div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-[#132038] p-3">
+                <div className="text-[10px] font-bold text-slate-400 uppercase">Grace / Next Decay</div>
+                <div className="mt-1 font-mono-tabular text-[11px] font-bold text-cyan-200">
+                  {vipStatus === 'Active'
+                    ? `${vipGraceDays}d grace after expiry`
+                    : nextDecayFormatted
+                      ? `Decay: ${nextDecayFormatted}`
+                      : `${vipGraceDays}d grace`}
+                </div>
+              </div>
+            </div>
+
             <div className="mt-4">
               <div className="flex items-center justify-between font-mono-tabular text-xs text-amber-300">
-                <span>Current VIP {effectiveVipLevel} Growth: {vipGrowth.toLocaleString()}</span>
+                <span>
+                  {vipStatus === 'Active'
+                    ? `Current VIP ${effectiveVipLevel} Points: ${vipGrowth.toLocaleString()}`
+                    : `Saved VIP Points: ${vipGrowth.toLocaleString()} ${vipEarnedLevel > 0 ? `(Tier Lv.${vipEarnedLevel})` : ''}`}
+                </span>
                 {nextVipTier && (
                   <span className="text-slate-400">
-                    Next VIP {nextVipTier.level}: {nextVipTier.minGrowth.toLocaleString()}
+                    Next VIP {nextVipTier.level}: {nextVipTier.minGrowth.toLocaleString()} pts
                   </span>
                 )}
               </div>
@@ -1295,9 +1536,11 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   className="h-full rounded-full bg-gradient-to-r from-amber-500 to-yellow-300"
                   style={{
                     width: `${
-                      nextVipTier
-                        ? Math.min(100, Math.max(6, Math.round((vipGrowth / nextVipTier.minGrowth) * 100)))
-                        : 100
+                      vipStatus !== 'Active'
+                        ? 0
+                        : nextVipTier
+                          ? Math.min(100, Math.max(6, Math.round((vipGrowth / nextVipTier.minGrowth) * 100)))
+                          : 100
                     }%`,
                   }}
                 />
@@ -1326,23 +1569,38 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 </div>
               </div>
               <div className="font-mono-tabular text-xs text-amber-200">
-                {previewVipInfo.minGrowth.toLocaleString()} Growth
+                {previewVipInfo.minGrowth.toLocaleString()} Pts
               </div>
             </div>
           </div>
 
-          {/* VIP Subscriptions */}
+          {/* VIP Subscriptions (Permanent UPI Checkout) */}
           <div className="rounded-3xl border border-white/10 bg-[#0D1526] p-6 shadow-xl">
-            <h2 className="font-display text-2xl font-bold text-white">VIP Subscriptions (INR)</h2>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="font-display text-2xl font-bold text-white">VIP Subscriptions (INR · UPI)</h2>
+                <p className="mt-1 text-xs text-slate-400">
+                  Every package activates at VIP 1 (or extends your current membership validity while preserving earned VIP progression).
+                </p>
+              </div>
+              <span className="rounded-full border border-amber-400/35 bg-amber-500/15 px-3 py-1 text-[11px] font-bold text-amber-200">
+                All Packages Start at VIP 1
+              </span>
+            </div>
             <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-              {VIP_PLANS.map((plan) => (
+              {displayVipPlans.map((plan) => (
                 <div
                   key={plan.id}
                   className="flex flex-col justify-between rounded-2xl border border-amber-400/30 bg-[#132038] p-5"
                 >
                   <div>
-                    <div className="flex items-center justify-between">
-                      <h3 className="font-display text-xl font-bold text-white">{plan.name}</h3>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <h3 className="font-display text-xl font-bold text-white">{plan.name}</h3>
+                        <span className="text-[11px] font-semibold text-cyan-300">
+                          Starts at VIP 1{plan.durationDays ? ` · ${plan.durationDays} Days` : ''}
+                        </span>
+                      </div>
                       <span className="font-mono-tabular text-lg font-bold text-amber-300">
                         ₹{plan.priceInr} INR
                       </span>
@@ -1350,7 +1608,7 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                     <ul className="mt-3 space-y-1.5 text-xs text-slate-300">
                       {plan.perks.map((perk) => (
                         <li key={perk} className="flex items-center gap-2">
-                          <Check className="h-3.5 w-3.5 text-emerald-400" />
+                          <Check className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
                           <span>{perk}</span>
                         </li>
                       ))}
@@ -1358,97 +1616,219 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   </div>
                   <button
                     type="button"
-                    onClick={() => {
-                      const bonusGrowth = plan.grantedVipLevel >= 10 ? 3_500 : 1_000;
-                      onBuyVip(plan.name, plan.priceInr, plan.grantedVipLevel, bonusGrowth);
-                      setPurchaseNotice(
-                        `Activated ${plan.name} (₹${plan.priceInr} INR) — +${bonusGrowth.toLocaleString()} VIP Growth!`
-                      );
+                    onClick={async () => {
+                      if (onCreatePaymentOrder) {
+                        await onCreatePaymentOrder('vip', plan.id);
+                      } else {
+                        const result = await onBuyVip(plan.id);
+                        setPurchaseNotice(result.message);
+                      }
                     }}
                     className="mt-5 w-full rounded-xl bg-emerald-500 py-2.5 text-xs font-bold text-slate-950 hover:bg-emerald-400"
                   >
-                    Subscribe · ₹{plan.priceInr} INR
+                    {vipStatus === 'Active' ? 'Renew / Extend' : 'Pay via UPI'} · ₹{plan.priceInr} INR
                   </button>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* INR Coin Packs + Custom Payment QR Code */}
+          {/* VIP Point Ledger & Subscription History */}
+          {(vipPointLedger.length > 0 || vipSubscriptionHistory.length > 0) && (
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <div className="rounded-3xl border border-white/10 bg-[#0D1526] p-5 shadow-xl">
+                <h3 className="font-display text-base font-bold text-amber-300">VIP Point Ledger</h3>
+                {vipPointLedger.length === 0 ? (
+                  <p className="mt-2 text-xs text-slate-400">No VIP point transactions recorded yet.</p>
+                ) : (
+                  <div className="mt-3 max-h-64 space-y-1.5 overflow-y-auto pr-1 text-xs">
+                    {vipPointLedger.map((row) => (
+                      <div key={row.id} className="flex items-center justify-between rounded-xl bg-[#132038] px-3 py-2">
+                        <div>
+                          <div className="font-semibold text-white">{row.reason}</div>
+                          <div className="text-[10px] text-slate-400">
+                            {row.eventType} · {new Date(row.createdAt).toLocaleString()}
+                          </div>
+                        </div>
+                        <div className="text-right font-mono-tabular">
+                          <div className={row.deltaPoints >= 0 ? 'font-bold text-emerald-300' : 'font-bold text-rose-300'}>
+                            {row.deltaPoints >= 0 ? `+${row.deltaPoints}` : row.deltaPoints} pts
+                          </div>
+                          <div className="text-[10px] text-slate-400">Bal: {row.pointsAfter.toLocaleString()} (Lv.{row.vipLevelAfter})</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-3xl border border-white/10 bg-[#0D1526] p-5 shadow-xl">
+                <h3 className="font-display text-base font-bold text-cyan-300">VIP Subscription History</h3>
+                {vipSubscriptionHistory.length === 0 ? (
+                  <p className="mt-2 text-xs text-slate-400">No VIP subscriptions or grants recorded yet.</p>
+                ) : (
+                  <div className="mt-3 max-h-64 space-y-1.5 overflow-y-auto pr-1 text-xs">
+                    {vipSubscriptionHistory.map((h) => (
+                      <div key={h.id} className="flex items-center justify-between rounded-xl bg-[#132038] px-3 py-2">
+                        <div>
+                          <div className="font-semibold text-white">
+                            {h.packageName || h.actionType}
+                          </div>
+                          <div className="text-[10px] text-slate-400">
+                            {h.reason || `${h.daysGranted} days`} · {new Date(h.createdAt).toLocaleDateString()}
+                          </div>
+                        </div>
+                        <div className="text-right font-mono-tabular">
+                          <div className="font-bold text-amber-300">VIP {h.vipLevelAssigned}</div>
+                          <div className="text-[10px] text-emerald-300">
+                            {h.expiresAtAfter ? `Exp: ${new Date(h.expiresAtAfter).toLocaleDateString()}` : `${h.daysGranted}d`}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Coin Top-Up (Order-First UPI Checkout) */}
           <div className="rounded-3xl border border-white/10 bg-[#0D1526] p-6 shadow-xl">
             <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
               <div>
                 <h2 className="font-display text-2xl font-bold text-white">
-                  Coin Top-Up (INR) &amp; Payment QR
+                  Coin Top-Up (INR · UPI)
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Upload your own UPI / Payment QR code for INR coin purchases.
+                  Select a coin package to create an order and load the latest verified payment QR inside checkout.
                 </p>
               </div>
-              <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-amber-400/40 bg-amber-500/15 px-3.5 py-2 text-xs font-semibold text-amber-200 hover:bg-amber-500/25">
-                <Upload className="h-3.5 w-3.5" />
-                <span>Upload My QR Code</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleQrFileChange}
-                  className="hidden"
-                />
-              </label>
+              <span className="rounded-full border border-emerald-400/35 bg-emerald-500/15 px-3 py-1 text-[11px] font-bold text-emerald-300">
+                Order-First Verified UPI
+              </span>
             </div>
 
-            <div className="mt-4 grid grid-cols-1 gap-5 lg:grid-cols-12">
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:col-span-9 lg:grid-cols-5">
-                {COIN_PACKAGES.map((pkg) => (
+            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              {displayCoinPacks.map((pkg) => (
+                <div
+                  key={pkg.id}
+                  className="flex flex-col justify-between rounded-2xl border border-white/15 bg-[#132038] p-4"
+                >
+                  <div>
+                    <div className="text-[11px] font-semibold text-amber-300">
+                      {pkg.highlight || 'Coin Bundle'}
+                    </div>
+                    <div className="font-display mt-2 text-lg font-extrabold text-white">
+                      {pkg.label}
+                    </div>
+                    <div className="mt-1 font-mono-tabular text-xs text-slate-400">
+                      {Number(pkg.coins).toLocaleString()} Coins
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (onCreatePaymentOrder) {
+                        await onCreatePaymentOrder('coins', pkg.id);
+                      } else {
+                        const result = await onBuyCoins(pkg.id);
+                        setPurchaseNotice(result.message);
+                      }
+                    }}
+                    className="mt-4 w-full rounded-xl bg-amber-500 py-2 text-xs font-bold text-slate-950 hover:bg-amber-400"
+                  >
+                    Pay ₹{pkg.priceInr}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Payment Orders Status Tracker */}
+          {orders.length > 0 && (
+            <div className="rounded-3xl border border-white/10 bg-[#0D1526] p-6 shadow-xl">
+              <h3 className="font-display text-lg font-bold text-white">My UPI Payment Orders</h3>
+              <div className="mt-3 space-y-2">
+                {orders.map((ord) => (
                   <div
-                    key={pkg.id}
-                    className="flex flex-col justify-between rounded-2xl border border-white/15 bg-[#132038] p-4"
+                    key={ord.orderId}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-[#132038] px-4 py-3 text-xs"
                   >
                     <div>
-                      <div className="text-[11px] font-semibold text-amber-300">
-                        {pkg.highlight || 'Standard Bundle'}
+                      <div className="font-bold text-white">
+                        {ord.packageName} · ₹{ord.amountInr} INR
                       </div>
-                      <div className="font-display mt-2 text-lg font-extrabold text-white">
-                        {pkg.label}
+                      <div className="font-mono-tabular text-[11px] text-slate-400">
+                        {ord.orderId}
+                        {ord.utrNumber ? ` · UTR: ${ord.utrNumber}` : ''}
                       </div>
-                      <div className="mt-1 font-mono-tabular text-xs text-slate-400">
-                        {pkg.coins.toLocaleString()} Coins
-                      </div>
+                      {ord.reviewNote && (
+                        <div className="mt-0.5 text-[11px] text-rose-300">Note: {ord.reviewNote}</div>
+                      )}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        onBuyCoins(pkg.coins, pkg.priceInr);
-                        setPurchaseNotice(`Added ${pkg.label} (₹${pkg.priceInr} INR)!`);
-                      }}
-                      className="mt-4 w-full rounded-xl bg-amber-500 py-2 text-xs font-bold text-slate-950 hover:bg-amber-400"
-                    >
-                      ₹{pkg.priceInr} INR
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase ${
+                          ord.status === 'approved'
+                            ? 'bg-emerald-500/20 text-emerald-300'
+                            : ord.status === 'rejected'
+                              ? 'bg-rose-500/20 text-rose-300'
+                              : ord.status === 'pending_review'
+                                ? 'bg-amber-500/20 text-amber-200'
+                                : 'bg-cyan-500/20 text-cyan-200'
+                        }`}
+                      >
+                        {ord.status.replace('_', ' ')}
+                      </span>
+                      {ord.status === 'pending_proof' && onReopenOrderModal && (
+                        <button
+                          type="button"
+                          onClick={() => onReopenOrderModal(ord)}
+                          className="rounded-xl bg-cyan-500 px-3 py-1.5 text-[11px] font-extrabold text-slate-950"
+                        >
+                          Submit UTR
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
+            </div>
+          )}
 
-              <div className="flex flex-col items-center justify-center rounded-2xl border border-white/15 bg-[#132038] p-4 text-center lg:col-span-3">
-                {customQrUrl ? (
-                  <img
-                    src={customQrUrl}
-                    alt="Custom Payment QR Code"
-                    className="h-36 w-36 rounded-lg bg-white object-contain p-1"
-                  />
+          {/* Wallet Transaction Ledger */}
+          <div className="rounded-3xl border border-white/10 bg-[#0D1526] p-6 shadow-xl">
+            <h3 className="font-display text-lg font-bold text-white">Wallet Ledger</h3>
+            <div className="zayro-scroll mt-3 max-h-56 space-y-2 overflow-y-auto pr-1">
+                {walletTransactions.length === 0 ? (
+                  <p className="py-6 text-center text-xs text-slate-400">No wallet transactions yet.</p>
                 ) : (
-                  <div className="flex h-36 w-36 flex-col items-center justify-center rounded-lg border border-dashed border-white/20 bg-white/5 text-slate-400">
-                    <QrCode className="h-12 w-12 text-amber-300" />
-                    <span className="mt-2 text-[11px]">No QR uploaded yet</span>
-                  </div>
+                  walletTransactions.map((tx) => (
+                    <div
+                      key={tx.txId}
+                      className="flex items-center justify-between gap-2 rounded-xl bg-[#132038] px-3 py-2 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate font-semibold text-white">{tx.description}</div>
+                        <div className="font-mono-tabular text-[10px] text-slate-400">
+                          {tx.txId} · Balance: {Number(tx.balanceAfter).toLocaleString()}
+                        </div>
+                      </div>
+                      <span
+                        className={`shrink-0 font-mono-tabular font-extrabold ${
+                          tx.amount >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                        }`}
+                      >
+                        {tx.amount >= 0 ? `+${tx.amount.toLocaleString()}` : tx.amount.toLocaleString()}
+                      </span>
+                    </div>
+                  ))
                 )}
-                <div className="mt-2 text-xs font-semibold text-white">Merchant INR QR</div>
-                <div className="text-[10px] text-slate-400">Scan to pay INR packages</div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* SUB-VIEW: Charm Levels (Lv. 1 - 21) & Joined Rooms */}
       {activeView === 'charm' && (
@@ -1524,7 +1904,7 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
         </div>
       )}
 
-      {/* SUB-VIEW: All Badges Gallery (VIP Lv.1-18 with Name Colors, Charm Lv.1-21, Room Lv.1-20) */}
+      {/* SUB-VIEW: All Badges Gallery (VIP Lv.1-15 with Name Colors, Charm Lv.1-21, Room Lv.1-20) */}
       {activeView === 'badges' && (
         <div className="space-y-6">
           <div className="rounded-3xl border border-amber-400/25 bg-[#0D1526] p-6 shadow-xl">
@@ -1534,7 +1914,7 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   VIP Badges &amp; Name Colors (Lv. 1 – 18)
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Name colors change every 2 VIP levels (V1–V11) &amp; shine in two colors beyond VIP 11 (V12–V18).
+                  Name colors change every 2 VIP levels (V1–V11) &amp; shine in animated dual/celestial colors beyond VIP 11 (V12–V18).
                 </p>
               </div>
               <VipBadgeArt level={effectiveVipLevel} size={46} />
@@ -1893,41 +2273,21 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
             </div>
           </div>
 
-          {/* Email */}
+          {/* Verified Gmail (Locked) */}
           <div>
-            <div className="text-xs font-semibold text-slate-300">Email</div>
+            <div className="text-xs font-semibold text-slate-300">Verified Gmail</div>
             <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/10 bg-[#132038] px-3.5 py-2.5 text-xs">
               <div className="flex min-w-0 flex-1 items-center gap-2">
-                {emailInput.trim() && !editingEmail && (
-                  <Check className="h-4 w-4 shrink-0 text-emerald-400" />
-                )}
-                {editingEmail ? (
-                  <input
-                    type="email"
-                    value={emailInput}
-                    onChange={(e) => setEmailInput(e.target.value)}
-                    placeholder="Enter your email address..."
-                    className="min-w-0 flex-1 bg-transparent text-xs text-white placeholder-slate-500 focus:outline-none"
-                  />
-                ) : (
-                  <span className={`truncate ${emailInput.trim() ? 'text-slate-200' : 'text-slate-400'}`}>
-                    {emailInput.trim() || 'Not linked'}
-                  </span>
-                )}
+                <Check className="h-4 w-4 shrink-0 text-emerald-400" />
+                <span className="truncate text-slate-200">
+                  {userProfile.email || 'Verified @gmail.com'}
+                </span>
               </div>
-              <div className="flex items-center gap-3">
-                {emailInput.trim() && (
-                  <span className="font-mono-tabular text-[11px] font-extrabold text-emerald-400">
-                    VERIFIED
-                  </span>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setEditingEmail((v) => !v)}
-                  className="font-bold text-cyan-300 hover:text-white"
-                >
-                  {editingEmail ? 'Done' : emailInput.trim() ? 'Change' : 'Link Email'}
-                </button>
+              <div className="flex items-center gap-1.5">
+                <Lock className="h-3.5 w-3.5 text-emerald-400" />
+                <span className="font-mono-tabular text-[11px] font-extrabold text-emerald-400">
+                  VERIFIED
+                </span>
               </div>
             </div>
           </div>
@@ -1935,10 +2295,25 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
           {/* Locked UID & Ornament */}
           <div className="grid grid-cols-1 gap-3 border-t border-white/10 pt-3 md:grid-cols-2">
             <div>
-              <div className="text-xs font-medium text-slate-400">User ID (Locked)</div>
-              <div className="mt-1 flex items-center gap-2 rounded-xl border border-white/10 bg-[#070B14] px-3 py-2 font-mono-tabular text-xs text-slate-400">
-                <Lock className="h-3.5 w-3.5 text-amber-300" />
-                <span>{userProfile.uid}</span>
+              <div className="text-xs font-medium text-slate-400">User ID (Permanent)</div>
+              <div className="mt-1 flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-[#070B14] px-3 py-2 font-mono-tabular text-xs text-slate-300">
+                <span className="inline-flex items-center gap-2">
+                  <Lock className="h-3.5 w-3.5 text-amber-300" />
+                  <span>{userProfile.publicId || userProfile.uid}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const idToCopy = userProfile.publicId || userProfile.uid;
+                    navigator.clipboard?.writeText(idToCopy).catch(() => {});
+                    setCopiedOwnId(true);
+                    window.setTimeout(() => setCopiedOwnId(false), 1800);
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg bg-white/10 px-2 py-0.5 text-[10px] font-bold text-cyan-200 hover:bg-white/20"
+                >
+                  {copiedOwnId ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                  <span>{copiedOwnId ? 'Copied' : 'Copy'}</span>
+                </button>
               </div>
             </div>
 
@@ -2144,55 +2519,84 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
             </div>
           </div>
 
-          {/* Send New Ring Proposal (Purchased Rings Only) */}
+          {/* Send New CP Bond Ring Proposal (Strict Owned-Ring Requirement) */}
           <div className="space-y-3 rounded-2xl border border-white/10 bg-[#132038] p-4">
-            <div className="text-sm font-bold text-white">Propose CP With a Purchased Ring</div>
+            <div>
+              <div className="text-sm font-bold text-white">Send CP Bond Ring Proposal</div>
+              <p className="mt-0.5 text-[11px] text-slate-400">
+                Enter any user&apos;s Public ID or pick a friend, choose one of your owned Bond Rings, and send a synchronized CP proposal.
+              </p>
+            </div>
             {ownedRings.length === 0 ? (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-400/30 bg-[#070B14] p-3">
-                <p className="text-xs text-slate-300">
-                  Purchase a ring in the Shop first. Only rings you own can be gifted to request CP.
-                </p>
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-400/35 bg-amber-500/10 p-3.5 text-xs">
+                <div>
+                  <div className="font-bold text-amber-200">Ring Purchase Required</div>
+                  <p className="mt-0.5 text-[11px] text-slate-300">
+                    You must purchase &amp; own a Ring in the Shop before sending a CP proposal.
+                  </p>
+                </div>
                 <button
                   type="button"
                   onClick={() => {
                     setShopCategory('ring');
                     setActiveView('shop');
                   }}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-amber-400 to-orange-500 px-3.5 py-2 text-xs font-extrabold text-slate-950 shadow hover:brightness-105"
+                  className="rounded-xl bg-gradient-to-r from-amber-500 to-rose-500 px-3.5 py-2 text-xs font-extrabold text-white shadow hover:brightness-110"
                 >
-                  <ShoppingBag className="h-3.5 w-3.5" />
-                  <span>Buy a Ring in Shop</span>
+                  Buy Ring in Shop
                 </button>
               </div>
             ) : (
               <>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div>
-                    <label htmlFor="cp-target-select" className="block text-[11px] font-semibold text-slate-400">
-                      Select Partner
+                  <div className="space-y-1.5">
+                    <label htmlFor="cp-target-id" className="block text-[11px] font-semibold text-slate-400">
+                      Partner Public User ID (e.g. 100002)
                     </label>
-                    <select
-                      id="cp-target-select"
+                    <input
+                      id="cp-target-id"
+                      type="text"
                       value={cpTargetUid}
-                      onChange={(e) => setCpTargetUid(e.target.value)}
-                      className="mt-1 w-full rounded-xl border border-white/15 bg-[#070B14] px-3 py-2 text-xs text-white focus:border-cyan-400 focus:outline-none"
-                    >
-                      {AVATAR_ROSTER.map((av) => (
-                        <option key={av.uid} value={av.uid}>
-                          {getGenderSymbol(av.gender)} {av.name} ({av.uid})
-                        </option>
-                      ))}
-                    </select>
+                      onChange={(e) => {
+                        setCpTargetUid(e.target.value);
+                        const matchedFriend = friends.find(
+                          (f) => f.publicId === e.target.value || f.uid === e.target.value
+                        );
+                        setCpTargetNameDraft(matchedFriend?.name || '');
+                      }}
+                      placeholder="Enter Public User ID (e.g. 100002)"
+                      className="w-full rounded-xl border border-white/15 bg-[#070B14] px-3 py-2 font-mono-tabular text-xs text-white focus:border-cyan-400 focus:outline-none"
+                    />
+                    {friends.length > 0 && (
+                      <select
+                        aria-label="Or choose a friend"
+                        value={friends.some((f) => (f.publicId || f.uid) === cpTargetUid) ? cpTargetUid : ''}
+                        onChange={(e) => {
+                          if (!e.target.value) return;
+                          const fr = friends.find((f) => (f.publicId || f.uid) === e.target.value);
+                          setCpTargetUid(e.target.value);
+                          setCpTargetNameDraft(fr?.name || '');
+                        }}
+                        className="w-full rounded-xl border border-white/15 bg-[#070B14] px-3 py-1.5 text-[11px] text-slate-300 focus:border-cyan-400 focus:outline-none"
+                      >
+                        <option value="">-- Quick pick from Friends --</option>
+                        {friends.map((f) => (
+                          <option key={f.uid} value={f.publicId || f.uid}>
+                            {f.name} ({f.publicId || f.uid})
+                          </option>
+                        ))}
+                      </select>
+                    )}
                   </div>
                   <div>
                     <label htmlFor="cp-ring-select" className="block text-[11px] font-semibold text-slate-400">
-                      Choose Purchased Ring
+                      Choose Owned CP Bond Ring
                     </label>
                     <select
                       id="cp-ring-select"
-                      value={selectedOwnedRing?.ringNumber ?? ownedRings[0].ringNumber ?? 1}
+                      value={selectedBondRing?.ringNumber ?? 1}
                       onChange={(e) => setCpRingNumber(Number(e.target.value))}
-                      className="mt-1 w-full rounded-xl border border-white/15 bg-[#070B14] px-3 py-2 text-xs text-white focus:border-cyan-400 focus:outline-none"
+                      className="mt-1.5 w-full rounded-xl border border-white/15 bg-[#070B14] px-3 py-2 text-xs text-white focus:border-cyan-400 focus:outline-none"
                     >
                       {ownedRings.map((r) => (
                         <option key={r.id} value={r.ringNumber ?? 1}>
@@ -2205,44 +2609,49 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                   <div className="flex items-center gap-2.5">
                     <RingSpriteArt
-                      ringNumber={selectedOwnedRing?.ringNumber ?? 1}
+                      ringNumber={selectedBondRing?.ringNumber ?? 1}
                       size={42}
-                      alt={selectedOwnedRing?.name || 'Purchased Ring'}
+                      alt={selectedBondRing?.name || 'Bond Ring'}
+                      imageUrl={selectedBondRing?.imageUrl}
                     />
                     <span className="text-xs font-semibold text-rose-200">
-                      {selectedOwnedRing?.name || `Ring #${cpRingNumber}`}
+                      {selectedBondRing?.name || `Ring #${cpRingNumber}`}
                     </span>
                   </div>
                   <button
                     type="button"
-                    disabled={!selectedOwnedRing}
+                    disabled={!selectedBondRing || !cpTargetUid.trim()}
                     onClick={() => {
-                      if (!selectedOwnedRing) return;
-                      const target =
-                        AVATAR_ROSTER.find((a) => a.uid === cpTargetUid) ?? AVATAR_ROSTER[0];
-                      const ringNum = selectedOwnedRing.ringNumber ?? 1;
+                      const targetId = cpTargetUid.trim();
+                      if (!selectedBondRing || !targetId) return;
+                      const matchedFriend = friends.find((f) => (f.publicId || f.uid) === targetId);
+                      const targetName =
+                        cpTargetNameDraft ||
+                        matchedFriend?.name ||
+                        `User ${targetId}`;
+                      const ringNum = selectedBondRing.ringNumber ?? 1;
                       onProposeCp?.(
-                        target.uid,
-                        target.name,
-                        target.id,
+                        targetId,
+                        targetName,
+                        matchedFriend?.avatarId || 'av-neutral',
                         ringNum,
-                        selectedOwnedRing.name
+                        selectedBondRing.name
                       );
                       setPurchaseNotice(
-                        `Sent CP Ring proposal (${selectedOwnedRing.name}) to ${target.name} (${target.uid})!`
+                        `Sending CP Bond proposal (${selectedBondRing.name}) to ${targetId}...`
                       );
                     }}
                     className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-rose-500 to-pink-500 px-4 py-2 text-xs font-extrabold text-white shadow hover:opacity-95 disabled:opacity-40"
                   >
                     <Heart className="h-3.5 w-3.5 fill-white" />
-                    <span>Send Ring Proposal</span>
+                    <span>Send Bond Ring Proposal</span>
                   </button>
                 </div>
               </>
             )}
           </div>
 
-          {/* Pending & Sent CP Requests */}
+          {/* Pending & Sent CP Requests (Receiver-Only Accept/Decline) */}
           <div className="space-y-2.5">
             <h3 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
               CP Proposal Requests ({cpRequests.length})
@@ -2251,7 +2660,11 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
               <p className="text-xs text-slate-400">No CP requests yet.</p>
             ) : (
               cpRequests.map((req) => {
-                const isIncoming = req.toUid === userProfile.uid;
+                const selfPublicId = userProfile.publicId || userProfile.uid;
+                const isIncoming =
+                  req.direction === 'incoming' ||
+                  req.toUid === selfPublicId ||
+                  req.toUid === userProfile.uid;
                 return (
                   <div
                     key={req.id}
@@ -2272,14 +2685,14 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                       </div>
                     </div>
 
-                    {req.status === 'pending' && (
+                    {req.status === 'pending' && isIncoming && (
                       <div className="flex items-center gap-2">
                         <button
                           type="button"
                           onClick={() => onRespondCpRequest?.(req.id, true)}
                           className="rounded-xl bg-emerald-500 px-3 py-1.5 text-[11px] font-extrabold text-slate-950 hover:bg-emerald-400"
                         >
-                          {isIncoming ? 'Accept CP' : 'Accept Proposal'}
+                          Accept CP
                         </button>
                         <button
                           type="button"
@@ -2290,60 +2703,67 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                         </button>
                       </div>
                     )}
+                    {req.status === 'pending' && !isIncoming && (
+                      <span className="rounded-full border border-amber-400/30 bg-amber-500/15 px-3 py-1 text-[10px] font-bold text-amber-200">
+                        Awaiting Partner Response
+                      </span>
+                    )}
                   </div>
                 );
               })
             )}
           </div>
 
-          <div className="flex flex-wrap gap-2 pt-1">
-            {ownTags.map((tag) => (
-              <span
-                key={tag}
-                className="rounded-2xl border border-rose-400/35 bg-rose-500/15 px-3.5 py-1.5 text-xs font-bold text-rose-200"
-              >
-                {tag}
-              </span>
-            ))}
-          </div>
+          {/* CP Relationship History */}
+          {cpRelationshipHistory.length > 0 && (
+            <div className="space-y-2 pt-1">
+              <h3 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                CP Relationship History ({cpRelationshipHistory.length})
+              </h3>
+              <div className="space-y-2">
+                {cpRelationshipHistory.map((hist) => (
+                  <div
+                    key={hist.id}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-[#132038] px-3.5 py-2.5 text-xs"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <RingSpriteArt ringNumber={hist.ringNumber} size={32} alt={hist.ringName} />
+                      <div>
+                        <div className="font-bold text-white">
+                          {hist.partnerName} ({hist.partnerUid}) · {hist.ringName}
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          Started {new Date(hist.startedAt).toLocaleDateString()}
+                          {hist.endedAt ? ` · Ended ${new Date(hist.endedAt).toLocaleDateString()}` : ''}
+                        </div>
+                      </div>
+                    </div>
+                    <span
+                      className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase ${
+                        hist.status === 'active'
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'bg-white/10 text-slate-400'
+                      }`}
+                    >
+                      {hist.status} · {hist.cpCharm.toLocaleString()} Charm
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* SUB-VIEW: Visitors (Clicking opens user's Profile Page) */}
+      {/* SUB-VIEW: Visitors */}
       {activeView === 'visitors' && (
         <div className="rounded-3xl border border-white/10 bg-[#0D1526] p-6">
           <div className="flex items-center justify-between">
             <h2 className="font-display text-2xl font-bold text-white">Recent Visitors</h2>
-            <span className="rounded-full bg-rose-500 px-2.5 py-0.5 font-mono-tabular text-xs font-bold text-white">
-              +7 new
-            </span>
           </div>
-          <div className="mt-4 divide-y divide-white/10">
-            {AVATAR_ROSTER.map((av, idx) => (
-              <button
-                key={av.id}
-                type="button"
-                onClick={() =>
-                  onInspectUser?.({
-                    avatar: av,
-                    vipLevel: 4 + (idx % 6),
-                    charm: 160_000 - idx * 15_000,
-                    ringNumber: (idx % 5) + 1,
-                  })
-                }
-                className="flex w-full items-center justify-between rounded-xl px-2 py-3 text-left transition-colors hover:bg-white/5"
-              >
-                <div className="flex items-center gap-3">
-                  <AvatarArt avatar={av} size={38} />
-                  <div>
-                    <div className="text-sm font-bold text-white">{av.name}</div>
-                    <div className="font-mono-tabular text-[11px] text-slate-400">{av.uid}</div>
-                  </div>
-                </div>
-                <span className="text-xs font-semibold text-cyan-300">View Profile</span>
-              </button>
-            ))}
-          </div>
+          <p className="mt-4 rounded-2xl border border-white/10 bg-[#132038] p-5 text-center text-xs text-slate-400">
+            Real-time profile visitor history is not enabled yet.
+          </p>
         </div>
       )}
 
@@ -2460,18 +2880,27 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                     <input
                       type="file"
                       accept="video/*"
-                      onChange={(e) => {
+                      onChange={async (e) => {
                         const f = e.target.files?.[0];
+                        e.target.value = '';
                         if (!f) return;
-                        setCgVideoName(f.name);
-                        if (f.size <= 3_500_000) {
-                          const reader = new FileReader();
-                          reader.onload = () => {
-                            if (typeof reader.result === 'string') setCgVideoUrl(reader.result);
-                          };
-                          reader.readAsDataURL(f);
-                        } else {
-                          setCgVideoUrl(URL.createObjectURL(f));
+                        setMediaUploadPct(15);
+                        setPurchaseNotice(`Uploading video ${f.name}...`);
+                        try {
+                          const uploadedVideo = await uploadVideoAsset(f, {
+                            authToken,
+                            maxBytes: 5_000_000,
+                            onProgress: (pct) => setMediaUploadPct(pct),
+                          });
+                          setCgVideoName(f.name);
+                          setCgVideoUrl(uploadedVideo);
+                          setPurchaseNotice('Gift animation video ready.');
+                        } catch (err) {
+                          setCgVideoName('');
+                          setCgVideoUrl(undefined);
+                          setPurchaseNotice(err instanceof Error ? err.message : 'Failed to upload gift video.');
+                        } finally {
+                          setMediaUploadPct(null);
                         }
                       }}
                       className="hidden"
@@ -2517,14 +2946,27 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                   <input
                     type="file"
                     accept="image/*"
-                    onChange={(e) => {
+                    onChange={async (e) => {
                       const f = e.target.files?.[0];
+                      e.target.value = '';
                       if (!f) return;
-                      const reader = new FileReader();
-                      reader.onload = () => {
-                        if (typeof reader.result === 'string') setCgArtworkUrl(reader.result);
-                      };
-                      reader.readAsDataURL(f);
+                      setMediaUploadPct(10);
+                      setPurchaseNotice('Uploading gift artwork...');
+                      try {
+                        const uploadedArt = await uploadImageAsset(f, {
+                          authToken,
+                          maxDim: 640,
+                          quality: 0.86,
+                          maxCompressedBytes: 550_000,
+                          onProgress: (pct) => setMediaUploadPct(pct),
+                        });
+                        setCgArtworkUrl(uploadedArt);
+                        setPurchaseNotice('Gift artwork uploaded!');
+                      } catch (err) {
+                        setPurchaseNotice(err instanceof Error ? err.message : 'Could not upload gift artwork image.');
+                      } finally {
+                        setMediaUploadPct(null);
+                      }
                     }}
                     className="hidden"
                   />
@@ -2600,13 +3042,13 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 Custom Gift Submissions ({customGifts.length})
               </h3>
               <span className="text-[11px] text-slate-400">
-                Approve to publish live to Gift Dock
+                Reviewed by OG VELOCITY Admins before publishing
               </span>
             </div>
 
             {customGifts.length === 0 ? (
               <div className="rounded-2xl border border-white/10 bg-[#132038] p-5 text-center text-xs text-slate-400">
-                No custom gifts submitted yet. Create one above to send it for approval!
+                No custom gifts submitted yet. Create one above to send it for Admin approval!
               </div>
             ) : (
               <div className="space-y-2.5">
@@ -2654,7 +3096,7 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                             {cg.status === 'approved' && <CheckCircle2 className="h-3 w-3" />}
                             {cg.status === 'rejected' && <XCircle className="h-3 w-3" />}
                             {cg.status === 'pending' && <Clock className="h-3 w-3" />}
-                            {cg.status}
+                            {cg.status === 'pending' ? 'Pending Admin Review' : cg.status}
                           </span>
                         </div>
                         <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-300">
@@ -2663,49 +3105,11 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                         </div>
                         {cg.reviewNote && (
                           <div className="mt-0.5 text-[11px] text-rose-300">
-                            Note: {cg.reviewNote}
+                            Admin Note: {cg.reviewNote}
                           </div>
                         )}
                       </div>
                     </div>
-
-                    {cg.status === 'pending' && (
-                      <div className="flex flex-wrap items-center gap-2">
-                        <input
-                          type="text"
-                          value={cgRejectNotes[cg.id] ?? ''}
-                          onChange={(e) =>
-                            setCgRejectNotes((prev) => ({ ...prev, [cg.id]: e.target.value }))
-                          }
-                          placeholder="Optional note..."
-                          className="w-32 rounded-lg border border-white/15 bg-[#070B14] px-2 py-1 text-[11px] text-white focus:outline-none"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            onReviewCustomGift?.(cg.id, 'approved', cgRejectNotes[cg.id]?.trim());
-                            setPurchaseNotice(`Approved "${cg.name}"! Now available in Gift Docks.`);
-                          }}
-                          className="rounded-xl bg-emerald-500 px-3 py-1.5 text-[11px] font-extrabold text-slate-950 hover:bg-emerald-400"
-                        >
-                          Approve
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            onReviewCustomGift?.(
-                              cg.id,
-                              'rejected',
-                              cgRejectNotes[cg.id]?.trim() || 'Needs artwork adjustment'
-                            );
-                            setPurchaseNotice(`Rejected "${cg.name}".`);
-                          }}
-                          className="rounded-xl bg-rose-500/20 px-3 py-1.5 text-[11px] font-bold text-rose-200 hover:bg-rose-500/35"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    )}
                   </div>
                 ))}
               </div>
@@ -2740,7 +3144,12 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
               Update or clear your profile photo and cover banner
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2.5">
-              <AvatarArt avatar={userProfile} size={44} frameId={equippedItems.frame} />
+              <AvatarArt
+                avatar={userProfile}
+                size={44}
+                frameId={equippedItems.frame}
+                frameImageUrl={equippedFrame?.imageUrl}
+              />
               <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl bg-cyan-500 px-3 py-2 text-xs font-bold text-slate-950 hover:bg-cyan-400">
                 <Camera className="h-3.5 w-3.5" />
                 <span>Change Profile Photo</span>
@@ -2789,6 +3198,29 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
           </div>
 
           <div className="space-y-3">
+            {/* Dark / Light Mode Toggle */}
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-[#132038] p-4">
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-500/15 text-amber-300">
+                  {themeMode === 'light' ? <Sun className="h-4.5 w-4.5" /> : <Moon className="h-4.5 w-4.5" />}
+                </div>
+                <div>
+                  <div className="text-sm font-bold text-white">Appearance Theme</div>
+                  <div className="text-xs text-slate-400">
+                    Current: {themeMode === 'light' ? 'Light Mode' : 'Dark Mode'} (saved to your profile)
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => onToggleThemeMode?.()}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-cyan-400/40 bg-cyan-500/20 px-3.5 py-2 text-xs font-bold text-cyan-200 hover:bg-cyan-500/35"
+              >
+                {themeMode === 'light' ? <Moon className="h-3.5 w-3.5" /> : <Sun className="h-3.5 w-3.5" />}
+                <span>Switch to {themeMode === 'light' ? 'Dark' : 'Light'} Mode</span>
+              </button>
+            </div>
+
             {/* Disable Gift Animations Toggle */}
             <label className="flex cursor-pointer items-center justify-between rounded-2xl bg-[#132038] p-4">
               <div>
@@ -2850,9 +3282,229 @@ export const MeProfileShop: React.FC<MeProfileShopProps> = ({
                 className="h-4 w-4 accent-cyan-400"
               />
             </label>
+
+            {onLogout && (
+              <div className="flex items-center justify-between rounded-2xl border border-red-400/20 bg-red-500/5 p-4">
+                <div>
+                  <div className="text-sm font-bold text-white">Account Session</div>
+                  <div className="text-xs text-slate-400">
+                    Signed in as {userProfile.email || userProfile.uid}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-400/40 bg-red-500/15 px-3.5 py-2 text-xs font-bold text-red-200 transition-colors hover:bg-red-500/25"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  Sign Out
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
+
+      {/* SUB-VIEW: Invite Friend & Referral Rewards */}
+      {activeView === 'invite' && (() => {
+        const activeInviteCode = referralSummary?.inviteCode || `OGV-${userProfile.publicId || userProfile.uid}`;
+        const shareLink =
+          typeof window !== 'undefined'
+            ? `${window.location.origin}/?ref=${encodeURIComponent(activeInviteCode)}`
+            : `/?ref=${encodeURIComponent(activeInviteCode)}`;
+        const rewardEach = referralSummary?.rewardCoins ?? 25000;
+        return (
+          <div className="space-y-5 rounded-3xl border border-emerald-400/25 bg-[#0D1526] p-6 shadow-xl">
+            <div className="flex items-center gap-3">
+              <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-500 text-slate-950 shadow-lg">
+                <UserPlus className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="font-display text-2xl font-bold text-white">Invite Friends &amp; Earn</h2>
+                <p className="text-xs text-slate-400">
+                  +{rewardEach.toLocaleString()} Coins for you &amp; +{rewardEach.toLocaleString()} Coins for your friend on every verified referral!
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded-2xl border border-emerald-400/20 bg-[#132038] p-3.5 text-center">
+                <div className="text-[11px] text-slate-400">Friends Invited</div>
+                <div className="mt-0.5 font-mono-tabular text-xl font-black text-emerald-300">
+                  {referralSummary?.totalInvited ?? 0}
+                </div>
+              </div>
+              <div className="rounded-2xl border border-amber-400/20 bg-[#132038] p-3.5 text-center">
+                <div className="text-[11px] text-slate-400">Referral Coins Earned</div>
+                <div className="mt-0.5 inline-flex items-center justify-center gap-1 font-mono-tabular text-xl font-black text-amber-300">
+                  <ZayroCoinArt size={16} />
+                  <span>{(referralSummary?.totalEarnedCoins ?? 0).toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-emerald-400/30 bg-[#132038] p-4 space-y-3">
+              <div>
+                <div className="text-xs font-semibold text-slate-300">Your Personal Invite Code &amp; Link</div>
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/10 bg-[#070B14] px-3.5 py-2.5">
+                  <div>
+                    <div className="font-mono-tabular text-sm font-black tracking-wider text-emerald-300">
+                      {activeInviteCode}
+                    </div>
+                    <div className="truncate max-w-[220px] text-[10px] text-slate-400">{shareLink}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(shareLink).catch(() => {});
+                      setInviteCopied(true);
+                      onInviteFriendApp?.();
+                      setPurchaseNotice('Invite link copied! Share it with friends to earn +25,000 Coins.');
+                      window.setTimeout(() => setInviteCopied(false), 2000);
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 px-3 py-1.5 text-xs font-extrabold text-slate-950 hover:bg-emerald-400"
+                  >
+                    {inviteCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                    <span>{inviteCopied ? 'Copied!' : 'Copy Invite Link'}</span>
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={async () => {
+                  if (navigator.share) {
+                    try {
+                      await navigator.share({
+                        title: 'Join OG VELOCITY',
+                        text: `Join me on OG VELOCITY with code ${activeInviteCode} to get +25,000 Coins!`,
+                        url: shareLink,
+                      });
+                    } catch {
+                      navigator.clipboard?.writeText(shareLink).catch(() => {});
+                    }
+                  } else {
+                    navigator.clipboard?.writeText(shareLink).catch(() => {});
+                  }
+                  onInviteFriendApp?.();
+                  setPurchaseNotice('Invite link ready! Friends get +25,000 Coins upon claiming.');
+                }}
+                className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-emerald-400 to-teal-400 py-3 text-xs font-extrabold text-slate-950 shadow-lg hover:brightness-105"
+              >
+                <Share2 className="h-4 w-4" />
+                <span>Share Invite Link (+25,000 Coins Each)</span>
+              </button>
+            </div>
+
+            {onClaimReferralCode && (
+              <div className="rounded-2xl border border-cyan-400/25 bg-[#132038] p-4 space-y-2.5">
+                <div className="text-xs font-bold text-white">Claim a Friend&apos;s Invite Code</div>
+                {referralSummary?.referredByPublicId ? (
+                  <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-200">
+                    Referral reward already claimed (Invited by User #{referralSummary.referredByPublicId}).
+                  </div>
+                ) : (
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const clean = claimInviteInput.trim();
+                      if (!clean) return;
+                      setClaimingInvite(true);
+                      setClaimInviteFeedback(null);
+                      try {
+                        const res = await onClaimReferralCode(clean);
+                        setClaimInviteFeedback(res);
+                        if (res.ok) setClaimInviteInput('');
+                      } finally {
+                        setClaimingInvite(false);
+                      }
+                    }}
+                    className="flex flex-wrap gap-2"
+                  >
+                    <input
+                      type="text"
+                      value={claimInviteInput}
+                      onChange={(e) => setClaimInviteInput(e.target.value)}
+                      placeholder="Enter code (e.g. OGV-100001)"
+                      className="min-w-0 flex-1 rounded-xl border border-white/15 bg-[#070B14] px-3 py-2 font-mono-tabular text-xs text-white focus:border-cyan-400 focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      disabled={claimingInvite || !claimInviteInput.trim()}
+                      className="rounded-xl bg-cyan-500 px-4 py-2 text-xs font-extrabold text-slate-950 hover:bg-cyan-400 disabled:opacity-50"
+                    >
+                      {claimingInvite ? 'Claiming...' : 'Claim +25,000'}
+                    </button>
+                  </form>
+                )}
+                {claimInviteFeedback && (
+                  <div
+                    className={`text-xs font-semibold ${
+                      claimInviteFeedback.ok ? 'text-emerald-300' : 'text-rose-300'
+                    }`}
+                  >
+                    {claimInviteFeedback.message}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {(referralSummary?.referrals?.length ?? 0) > 0 && (
+              <div className="space-y-2">
+                <h3 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                  Referral History ({referralSummary!.referrals.length})
+                </h3>
+                <div className="space-y-2">
+                  {referralSummary!.referrals.map((ref) => (
+                    <div
+                      key={ref.id}
+                      className="flex items-center justify-between rounded-2xl border border-white/10 bg-[#132038] px-3.5 py-2.5 text-xs"
+                    >
+                      <div>
+                        <div className="font-bold text-white">{ref.invitedName}</div>
+                        <div className="font-mono-tabular text-[10px] text-slate-400">
+                          ID {ref.invitedPublicId} · {new Date(ref.createdAt).toLocaleDateString()}
+                        </div>
+                      </div>
+                      <span className="font-mono-tabular font-extrabold text-emerald-300">
+                        +{ref.rewardCoins.toLocaleString()} Coins
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      <CoupleHomeModal
+        isOpen={showRingCollection}
+        ownerAvatar={userProfile}
+        ownerVipLevel={effectiveVipLevel}
+        ownerCharm={charm}
+        cpPartner={userProfile.cpPartner ?? null}
+        ringNumbers={Array.from(
+          new Set([
+            ...ownedRings.map((r) => r.ringNumber ?? 1),
+            ...(userProfile.cpPartner?.ringNumber ? [userProfile.cpPartner.ringNumber] : []),
+          ])
+        )}
+        blessingCount={userProfile.blessing ?? 0}
+        isSelf={true}
+        equippedRingId={equippedItems.ring}
+        onClose={() => setShowRingCollection(false)}
+        onEquipRing={(ringItem) => {
+          onEquipShopItem(ringItem);
+          setPurchaseNotice(`Equipped ${ringItem.name}!`);
+        }}
+        onOpenRingShop={() => {
+          setShopCategory('ring');
+          setActiveView('shop');
+        }}
+        onInspectPartner={onInspectUser}
+        onInspectPartnerById={onInspectUserById}
+      />
     </div>
   );
 };

@@ -1,4 +1,5 @@
-import React, { useEffect, useRef } from 'react';
+import React from 'react';
+import { getCustomShopItemImage } from '../data/zayroData';
 import type { AvatarConfig } from '../types';
 import { SeatFrameSpriteArt } from './SpriteArtwork';
 
@@ -10,6 +11,7 @@ interface AvatarArtProps {
   isMuted?: boolean;
   frameId?: string;
   seatFrameNumber?: number;
+  frameImageUrl?: string;
 }
 
 export const resolveSeatFrameNumber = (
@@ -19,7 +21,11 @@ export const resolveSeatFrameNumber = (
   if (explicit && explicit >= 1) return Math.max(1, Math.min(20, Math.round(explicit)));
   if (!frameId) return undefined;
   const m = /^frame-(\d+)$/.exec(frameId);
-  if (m) return Math.max(1, Math.min(20, Number(m[1])));
+  if (m) {
+    const num = Number(m[1]);
+    if (num >= 1 && num <= 20) return num;
+    return undefined;
+  }
   if (frameId === 'frame-fire') return 7;
   if (frameId === 'frame-ice') return 2;
   if (frameId === 'frame-flower') return 15;
@@ -35,80 +41,11 @@ export const resolveSeatFrameNumber = (
 export const AvatarArt: React.FC<AvatarArtProps> = ({
   avatar,
   size = 76,
-  isSpeaking = false,
-  audioLevel = 0,
-  isMuted = false,
+  isMuted: _isMuted = false,
   frameId,
   seatFrameNumber,
+  frameImageUrl,
 }) => {
-  const ringCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const levelRef = useRef(audioLevel);
-  levelRef.current = audioLevel;
-  const speakingRef = useRef(isSpeaking && !isMuted);
-  speakingRef.current = isSpeaking && !isMuted;
-
-  useEffect(() => {
-    const canvas = ringCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const canvasSize = size + 32;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-    canvas.width = canvasSize * dpr;
-    canvas.height = canvasSize * dpr;
-    canvas.style.width = `${canvasSize}px`;
-    canvas.style.height = `${canvasSize}px`;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    let phase = Math.random() * Math.PI * 2;
-    let rafId = 0;
-
-    const draw = () => {
-      phase += 0.1;
-      ctx.clearRect(0, 0, canvasSize, canvasSize);
-      const center = canvasSize / 2;
-      const baseRadius = size / 2 + 4;
-
-      if (speakingRef.current) {
-        const energy = Math.max(0.28, levelRef.current);
-        const bars = 36;
-        ctx.save();
-        ctx.shadowColor = avatar.accentColor;
-        ctx.shadowBlur = 8;
-        ctx.strokeStyle = avatar.accentColor;
-        ctx.lineCap = 'round';
-        for (let i = 0; i < bars; i++) {
-          const theta = (i / bars) * Math.PI * 2;
-          const wave = Math.sin(phase * 1.45 + i * 0.65) * 0.5 + 0.5;
-          const barLen = 2.2 + wave * 8.5 * energy;
-          const x1 = center + Math.cos(theta) * baseRadius;
-          const y1 = center + Math.sin(theta) * baseRadius;
-          const x2 = center + Math.cos(theta) * (baseRadius + barLen);
-          const y2 = center + Math.sin(theta) * (baseRadius + barLen);
-          ctx.globalAlpha = 0.45 + wave * 0.55;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.stroke();
-        }
-        ctx.restore();
-      } else {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
-        ctx.lineWidth = 1.25;
-        ctx.beginPath();
-        ctx.arc(center, center, baseRadius, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      rafId = requestAnimationFrame(draw);
-    };
-
-    rafId = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(rafId);
-  }, [size, avatar.accentColor]);
-
   const uid = avatar.id.replace(/[^a-zA-Z0-9_-]/g, '');
 
   const frameRingStyle = (): React.CSSProperties | undefined => {
@@ -159,29 +96,35 @@ export const AvatarArt: React.FC<AvatarArtProps> = ({
               ? '🏛️'
               : null;
 
-  const resolvedSeatFrame = resolveSeatFrameNumber(frameId, seatFrameNumber ?? avatar.seatFrameNumber);
+  const effectiveFrameId = frameId ?? avatar.equippedFrameId ?? undefined;
+  const resolvedCustomImageUrl = frameImageUrl ?? getCustomShopItemImage(effectiveFrameId);
+  const resolvedSeatFrame = resolveSeatFrameNumber(
+    effectiveFrameId,
+    seatFrameNumber ?? avatar.seatFrameNumber
+  );
+  const hasOverlayFrame = Boolean(resolvedCustomImageUrl || resolvedSeatFrame);
+  const frameSpriteSize = Math.round(size * 1.48);
+  const outerSize = hasOverlayFrame ? Math.ceil(size * 1.54) : size;
 
   return (
     <div
-      className="relative inline-flex items-center justify-center select-none"
-      style={{ width: size + 24, height: size + 24 }}
+      className="relative inline-flex shrink-0 items-center justify-center overflow-visible select-none"
+      style={{ width: outerSize, height: outerSize }}
     >
-      <canvas
-        ref={ringCanvasRef}
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0"
-        style={{ left: -4, top: -4 }}
-      />
-      {resolvedSeatFrame && (
-        <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
+      {hasOverlayFrame && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center overflow-visible"
+        >
           <SeatFrameSpriteArt
-            frameNumber={resolvedSeatFrame}
-            size={Math.round(size * 1.38)}
-            alt={`Seat Frame ${resolvedSeatFrame}`}
+            frameNumber={resolvedSeatFrame ?? 1}
+            imageUrl={resolvedCustomImageUrl}
+            size={frameSpriteSize}
+            alt={`Seat Frame ${resolvedSeatFrame ?? effectiveFrameId ?? ''}`}
           />
         </div>
       )}
-      {!resolvedSeatFrame && frameGlyph && (
+      {!hasOverlayFrame && frameGlyph && (
         <span
           aria-hidden="true"
           className="pointer-events-none absolute -top-1 left-1/2 z-30 -translate-x-1/2 text-xs drop-shadow"
@@ -193,7 +136,7 @@ export const AvatarArt: React.FC<AvatarArtProps> = ({
         <img
           src={avatar.photoUrl}
           alt={avatar.name}
-          style={{ width: size, height: size, ...(resolvedSeatFrame ? {} : (frameRingStyle() ?? {})) }}
+          style={{ width: size, height: size, ...(hasOverlayFrame ? {} : (frameRingStyle() ?? {})) }}
           className="relative z-10 rounded-full object-cover shadow-xl"
         />
       ) : (
@@ -202,7 +145,7 @@ export const AvatarArt: React.FC<AvatarArtProps> = ({
           height={size}
           viewBox="0 0 120 120"
           fill="none"
-          style={resolvedSeatFrame ? undefined : frameRingStyle()}
+          style={hasOverlayFrame ? undefined : frameRingStyle()}
           className="relative z-10 rounded-full shadow-xl"
           aria-label={`${avatar.name} portrait`}
         >

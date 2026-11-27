@@ -1,0 +1,31 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Deny all unauthenticated or arbitrary bucket reads/writes by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    function isVerifiedUser() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidMediaId(name) {
+      return name is string && name.size() >= 1 && name.size() <= 128 && name.matches('^[a-zA-Z0-9._\\-]+$');
+    }
+
+    // User-uploaded avatars, covers, room wallpapers, chat photos & payment proofs (max 5 MB)
+    match /uploads/{userId}/{assetId} {
+      allow read: if isVerifiedUser() && isValidMediaId(assetId);
+      allow write: if isVerifiedUser()
+        && request.auth.uid == userId
+        && isValidMediaId(assetId)
+        && request.resource != null
+        && request.resource.size <= 5 * 1024 * 1024
+        && (
+          request.resource.contentType.matches('image/(png|jpeg|webp|gif)') ||
+          request.resource.contentType.matches('video/(mp4|webm)')
+        );
+    }
+  }
+}
